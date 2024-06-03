@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Podcademia</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #ffffff; /* Changed background to white */
+            text-align: center;
+            padding: 50px;
+        }
+        .logo {
+            width: 200px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: #333;
+        }
+        .menu, .submenu {
+            list-style-type: none;
+            padding: 0;
+        }
+        .menu li, .submenu li {
+            display: inline;
+            margin: 0 15px;
+        }
+        .menu a, .submenu a {
+            text-decoration: none;
+            color: #007BFF;
+            font-weight: bold;
+        }
+        .menu a:hover, .submenu a:hover {
+            text-decoration: underline;
+        }
+        .submenu {
+            display: none;
+        }
+        .submenu img {
+            width: 100px;
+            display: block;
+            margin: 20px auto;
+        }
+    </style>
+    <script>
+        function showSubMenu(type) {
+            document.getElementById('classic-submenu').style.display = 'none';
+            document.getElementById('summary-submenu').style.display = 'none';
+            document.getElementById('song-submenu').style.display = 'none';
+            document.getElementById(type + '-submenu').style.display = 'block';
+        }
+    </script>
+</head>
+<body>
+    <div class="logo">
+        <img src="Podcademia logo.png" alt="Podcademia Logo">
+    </div>
+    <h1>Welcome to Podcademia</h1>
+    <ul class="menu">
+        <li><a href="#classic" onclick="showSubMenu('classic')">Classic</a></li>
+        <li><a href="#summary" onclick="showSubMenu('summary')">Summary</a></li>
+        <li><a href="#song" onclick="showSubMenu('song')">Song</a></li>
+    </ul>
+    
+    <ul id="classic-submenu" class="submenu">
+        <img src="Classic.png" alt="Classic Audio">
+    </ul>
+    
+    <ul id="summary-submenu" class="submenu">
+        <img src="Summary.png" alt="Summary Audio">
+    </ul>
+    
+    <ul id="song-submenu" class="submenu">
+        <img src="Song.png" alt="Song Audio">
+    </ul>
+</body>
+</html>
+
