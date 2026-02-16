@@ -7,58 +7,29 @@
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 
   <style>
-    body { font-family: Arial; max-width: 920px; margin: 40px auto; }
-    button { padding:10px 20px; margin-top:10px; margin-right:10px; }
+    body { font-family: Arial; max-width: 900px; margin: 40px auto; }
+    button { padding:10px 16px; margin:10px 10px 0 0; }
     .error { color: red; }
     .success { color: green; }
     pre { background:#f5f5f5; padding:15px; white-space: pre-wrap; }
-    .row { margin: 8px 0; }
-    label { display:inline-block; width: 130px; }
-    input[type="number"] { width: 120px; }
   </style>
 </head>
-
 <body>
 
 <h1>AIESEC Matching Tool</h1>
 
-<div class="row">
-  EPs.csv: <input type="file" id="epsFile" accept=".csv">
-</div>
-<div class="row">
-  Locations.csv: <input type="file" id="locFile" accept=".csv">
-</div>
-
-<div class="row">
-  <label>Duration (weeks)</label>
-  <input type="number" id="weeksDuration" value="6" min="1" max="52">
-</div>
-<div class="row">
-  <label>Unassigned penalty</label>
-  <input type="number" id="penUnassigned" value="5000" min="0">
-</div>
-<div class="row">
-  <label>Fly-alone penalty</label>
-  <input type="number" id="penFlyAlone" value="80" min="0">
-</div>
-<div class="row">
-  <label>Score weight</label>
-  <input type="number" id="lambdaScore" value="5" min="0">
-</div>
+<h3>Upload files</h3>
+EPs.csv: <input type="file" id="epsFile"><br><br>
+Locations.csv: <input type="file" id="locFile"><br><br>
 
 <button id="btnValidate">Validate</button>
-<button id="btnRun">Run Matching</button>
+<button id="btnRun" disabled>Run Matching</button>
 
-<h3>Output</h3>
-<pre id="output">Loading solver…</pre>
+<h3>Status</h3>
+<pre id="output">Ready. Upload files, then validate.</pre>
 
 <script type="module">
-  import highsLoader from "https://esm.sh/highs@1.8.0";
-
-  let highs = null;
-  let epsData = null;
-  let locData = null;
-
+  // ---------------- UI helpers ----------------
   const out = document.getElementById("output");
   const btnValidate = document.getElementById("btnValidate");
   const btnRun = document.getElementById("btnRun");
@@ -73,76 +44,35 @@
     throw new Error(msg);
   }
 
+  function parseCSV(file) {
+    return new Promise((resolve, reject) => {
+      Papa.parse(file, {
+        header: true,
+        skipEmptyLines: true,
+        complete: r => resolve(r.data),
+        error: err => reject(err)
+      });
+    });
+  }
+
   function normalizeCode(s) {
     return (s || "").toLowerCase().trim().replaceAll(" ", "_");
-  }
-
-  function normalizeName(s) {
-    return (s || "").toLowerCase().trim().split(/\s+/).join(" ");
-  }
-
-  function normGender(s) {
-    const q = String(s || "").trim().toLowerCase();
-    if (["f","female","vrouw","woman","girl","vrouwelijk"].includes(q)) return "F";
-    if (["m","male","man","boy","jongen","mannelijk"].includes(q)) return "M";
-    return "X";
   }
 
   function parseDateFlexible(str) {
     if (!str) return null;
     str = String(str).trim();
 
-    if (/^\d{4}-\d{2}-\d{2}$/.test(str)) {
-      const d = new Date(str);
-      return isNaN(d) ? null : d;
-    }
+    if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return new Date(str);
+
     if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(str)) {
       const [a,b,c] = str.split("/");
-      const d1 = new Date(`${c}-${b}-${a}`);
+      const d1 = new Date(`${c}-${b}-${a}`); // dd/mm/yyyy
       if (!isNaN(d1)) return d1;
-      const d2 = new Date(`${c}-${a}-${b}`);
+      const d2 = new Date(`${c}-${a}-${b}`); // mm/dd/yyyy
       if (!isNaN(d2)) return d2;
     }
     return null;
-  }
-
-  function dateToISO(d) {
-    const yyyy = d.getFullYear();
-    const mm = String(d.getMonth()+1).padStart(2,"0");
-    const dd = String(d.getDate()).padStart(2,"0");
-    return `${yyyy}-${mm}-${dd}`;
-  }
-
-  function addDays(d, days) {
-    const x = new Date(d.getTime());
-    x.setDate(x.getDate() + days);
-    return x;
-  }
-
-  function addWeeks(d, w) {
-    return addDays(d, 7*w);
-  }
-
-  function weekdayMon0(d) {
-    // JS: Sun=0..Sat=6; we want Mon=0..Sun=6
-    const js = d.getDay();
-    return (js + 6) % 7;
-  }
-
-  function nextMonday(d) {
-    const wd = weekdayMon0(d); // Mon=0
-    const delta = (7 - wd) % 7;
-    return addDays(d, delta);
-  }
-
-  function mondaysBetween(startMonday, endMonday) {
-    const out = [];
-    let cur = new Date(startMonday.getTime());
-    while (cur.getTime() <= endMonday.getTime()) {
-      out.push(new Date(cur.getTime()));
-      cur = addWeeks(cur, 1);
-    }
-    return out;
   }
 
   function downloadCSV(filename, rows) {
@@ -154,57 +84,52 @@
     link.click();
   }
 
-  function parseCSV(file) {
-    return new Promise((resolve, reject) => {
-      Papa.parse(file, {
-        header: true,
-        skipEmptyLines: true,
-        complete: results => resolve(results.data),
-        error: err => reject(err)
-      });
+  // ---------------- Data ----------------
+  let epsData = null;
+  let locData = null;
+
+  // ---------------- HiGHS loader (fixed) ----------------
+  let highs = null;
+
+  async function loadHighsWithTimeout(ms = 60000) {
+    // highs-js is published on npm as "highs"
+    // esm.sh turns it into browser-friendly ESM.
+    const highsLoader = (await import("https://esm.sh/highs@1.8.0")).default;
+
+    const wasmBase = "https://lovasoa.github.io/highs-js/"; // contains highs.wasm
+    const highsPromise = highsLoader({
+      locateFile: (file) => wasmBase + file
     });
+
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Timed out loading solver (WASM not fetched).")), ms)
+    );
+
+    return Promise.race([highsPromise, timeout]);
   }
 
-async function initHighs() {
-  setStatus("Loading solver (HiGHS)…");
-
-  const timeoutMs = 30000;
-  const timeout = new Promise((_, rej) =>
-    setTimeout(() => rej(new Error("Timed out loading HiGHS (30s). This usually happens if you opened the file as file:// instead of http://, or if a CDN is blocked.")), timeoutMs)
-  );
-
-  try {
-    highs = await Promise.race([
-      highsLoader({
-        locateFile: (file) => "https://lovasoa.github.io/highs-js/" + file
-      }),
-      timeout
-    ]);
-    setStatus("Solver ready ✔ Upload files and validate.", "success");
-  } catch (e) {
-    console.error(e);
-    setStatus("ERROR: " + e.message, "error");
+  async function ensureSolverLoaded() {
+    if (highs) return;
+    setStatus("Loading solver (HiGHS)…", "");
+    try {
+      highs = await loadHighsWithTimeout(60000);
+      setStatus("Solver ready. Validate your files, then run matching.", "success");
+    } catch (e) {
+      console.error(e);
+      showError(
+        "Solver failed to load. Most common reasons:\n" +
+        "- You opened the file via file:// (must use https GitHub Pages URL)\n" +
+        "- A network/adblocker blocked highs.wasm\n" +
+        "- Corporate wifi blocks wasm/CDNs\n\n" +
+        "Details: " + (e?.message || e)
+      );
+    }
   }
-}
 
+  // Start loading solver in the background after page loads
+  ensureSolverLoaded();
 
-  initHighs().catch(err => {
-    console.error(err);
-    setStatus("ERROR: Solver failed to load. Open DevTools Console for details.", "error");
-  });
-
-  btnValidate.addEventListener("click", async () => {
-    const epsFile = document.getElementById("epsFile").files[0];
-    const locFile = document.getElementById("locFile").files[0];
-    if (!epsFile || !locFile) showError("Please upload both EPs.csv and Locations.csv");
-
-    setStatus("Reading CSV files…");
-    epsData = await parseCSV(epsFile);
-    locData = await parseCSV(locFile);
-
-    runValidation();
-  });
-
+  // ---------------- Validation ----------------
   function runValidation() {
     const requiredEPCols = [
       "ep_id","full_name","gender","earliest_start_date","latest_end_date",
@@ -213,8 +138,8 @@ async function initHighs() {
     ];
     const requiredLocCols = ["loc_code","capacity_total"];
 
-    const epHeaders = Object.keys(epsData[0] || {});
-    const locHeaders = Object.keys(locData[0] || {});
+    const epHeaders = Object.keys(epsData?.[0] || {});
+    const locHeaders = Object.keys(locData?.[0] || {});
 
     requiredEPCols.forEach(col => {
       if (!epHeaders.includes(col)) showError(`EPs.csv missing column "${col}"`);
@@ -223,6 +148,7 @@ async function initHighs() {
       if (!locHeaders.includes(col)) showError(`Locations.csv missing column "${col}"`);
     });
 
+    // duplicates
     const epIds = epsData.map(r => r.ep_id);
     const dupEP = epIds.find((id, i) => epIds.indexOf(id) !== i);
     if (dupEP) showError(`Duplicate ep_id found: ${dupEP}`);
@@ -231,6 +157,7 @@ async function initHighs() {
     const dupLoc = locCodes.find((id, i) => locCodes.indexOf(id) !== i);
     if (dupLoc) showError(`Duplicate loc_code found: ${dupLoc}`);
 
+    // dates
     epsData.forEach((row, i) => {
       const start = parseDateFlexible(row.earliest_start_date);
       const end = parseDateFlexible(row.latest_end_date);
@@ -239,543 +166,60 @@ async function initHighs() {
       if (start > end) showError(`Row ${i+2}: earliest_start_date after latest_end_date`);
     });
 
-    epsData.forEach((row, i) => {
-      const score = String(row.score ?? "").replace(",", ".");
-      if (score.trim() === "" || isNaN(parseFloat(score))) showError(`Row ${i+2}: score is not numeric`);
-    });
-
-    setStatus("Validation successful ✔ You can now run matching.", "success");
+    setStatus("Validation successful. You can now run matching.", "success");
+    btnRun.disabled = false;
   }
 
-  function prefScore(epRow, locCode) {
-    // same scoring you requested: 1=1000, 2=120, 3=20, 4=0; ignore "don't care"
-    const PREF_POINTS = {1:1000, 2:120, 3:20, 4:0};
-    const cleaned = [];
-    for (let k=1;k<=4;k++) {
-      const q = normalizeCode(epRow[`preferred_location_${k}`]);
-      if (!q) continue;
-      if (["i_don't_care","i_dont_care","idc","n/a","na","none","any","dont_care","don't_care"].includes(q)) continue;
-      cleaned.push(q);
-    }
-    const code = normalizeCode(locCode);
-    const idx = cleaned.indexOf(code);
-    if (idx >= 0) return PREF_POINTS[idx+1] ?? 0;
-    return 0;
-  }
+  // ---------------- Buttons ----------------
+  btnValidate.addEventListener("click", async () => {
+    const epsFile = document.getElementById("epsFile").files[0];
+    const locFile = document.getElementById("locFile").files[0];
+    if (!epsFile || !locFile) showError("Please upload both EPs.csv and Locations.csv");
 
-  function safeVarName(s) {
-    // LP format prefers simple names (no hyphens)
-    return s.replaceAll("-", "_").replaceAll(".", "_");
-  }
+    setStatus("Reading CSV files…", "");
+    epsData = await parseCSV(epsFile);
+    locData = await parseCSV(locFile);
 
-  function solveLP(lpText) {
-    const sol = highs.solve(lpText);
-    return sol;
-  }
-
-  function getColumns(sol) {
-    // highs-js typically returns { Columns: {x:val,...}, Status:"Optimal", ObjectiveValue:... }
-    // but we guard for other shapes.
-    if (sol && sol.Columns) return sol.Columns;
-    return null;
-  }
+    runValidation();
+  });
 
   btnRun.addEventListener("click", async () => {
     if (!epsData || !locData) showError("Please validate files first.");
-    if (!highs) showError("Solver still loading. Refresh if this persists.");
+    await ensureSolverLoaded();
 
-    const WEEKS_DURATION = parseInt(document.getElementById("weeksDuration").value, 10);
-    const PENALTY_UNASSIGNED = parseFloat(document.getElementById("penUnassigned").value);
-    const START_ALONE_PENALTY = parseFloat(document.getElementById("penFlyAlone").value);
-    const LAMBDA_SCORE = parseFloat(document.getElementById("lambdaScore").value);
+    // Pipeline test: run a tiny LP so you know the solver actually works.
+    setStatus("Running a solver test…", "");
 
-    setStatus("Building MILP…");
+    const lp = `
+Maximize
+ obj: x
+Subject To
+ c1: x <= 1
+Bounds
+ 0 <= x <= 1
+End
+`.trim();
 
-    // Normalize data
-    const EPs = epsData.map(r => ({
-      ep_id: String(r.ep_id).trim(),
-      full_name: String(r.full_name).trim(),
-      gender: normGender(r.gender),
-      earliest: parseDateFlexible(r.earliest_start_date),
-      latest: parseDateFlexible(r.latest_end_date),
-      pref1: normalizeCode(r.preferred_location_1),
-      wants_pair: String(r.wants_pair || "").trim().toLowerCase() === "yes",
-      pair_raw: String(r.pair_with_full_name || "").trim(),
-      score: Math.max(0, Math.min(10, parseFloat(String(r.score).replace(",", "."))))
+    let sol;
+    try {
+      sol = highs.solve(lp);
+    } catch (e) {
+      console.error(e);
+      showError("Solver loaded, but solve() failed: " + (e?.message || e));
+    }
+
+    // TEMP: produce a dummy assignment to prove download works
+    const assignments = epsData.map(ep => ({
+      ep_id: ep.ep_id,
+      full_name: ep.full_name,
+      location: "TO_BE_COMPUTED",
+      start_monday: "TO_BE_COMPUTED",
+      end_friday: "TO_BE_COMPUTED"
     }));
-
-    const Locations = locData.map(r => ({
-      loc_code: normalizeCode(r.loc_code),
-      capacity_total: parseInt(r.capacity_total, 10),
-      cap_female_max: (String(r.cap_female_max || "").trim()==="" ? null : parseInt(r.cap_female_max,10)),
-      cap_male_max:   (String(r.cap_male_max   || "").trim()==="" ? null : parseInt(r.cap_male_max,10)),
-    }));
-
-    const locCodes = Locations.map(L => L.loc_code);
-    const locBy = Object.fromEntries(Locations.map(L => [L.loc_code, L]));
-
-    // Allowed Monday starts per EP
-    const EP_allowed = new Map();
-    const allMondaysSet = new Set();
-
-    for (const e of EPs) {
-      const startM = nextMonday(e.earliest);
-      const lastCandidate = addWeeks(e.latest, -WEEKS_DURATION);
-      const lastStart = nextMonday(lastCandidate);
-      const allowed = (startM <= lastStart) ? mondaysBetween(startM, lastStart) : [];
-      EP_allowed.set(e.ep_id, allowed);
-      for (const d of allowed) allMondaysSet.add(dateToISO(d));
-    }
-
-    if (allMondaysSet.size === 0) showError("No feasible Monday starts found. Check date windows.");
-
-    const allMondays = Array.from(allMondaysSet).sort(); // ISO sorts ok
-    const minM = new Date(allMondays[0]);
-    const maxM = addWeeks(new Date(allMondays[allMondays.length-1]), WEEKS_DURATION-1);
-    const weeks = mondaysBetween(minM, maxM);
-    const weekIndex = new Map(weeks.map((d,i)=>[dateToISO(d), i]));
-
-    // Pair groups (connected components)
-    const nameToIds = new Map();
-    for (const e of EPs) {
-      const key = normalizeName(e.full_name);
-      if (!nameToIds.has(key)) nameToIds.set(key, []);
-      nameToIds.get(key).push(e.ep_id);
-    }
-
-    const adj = new Map();
-    function addEdge(a,b){
-      if (!adj.has(a)) adj.set(a, []);
-      if (!adj.has(b)) adj.set(b, []);
-      adj.get(a).push(b);
-      adj.get(b).push(a);
-    }
-
-    for (const e of EPs) {
-      if (!e.wants_pair) continue;
-      const friends = e.pair_raw.split(",").map(x=>normalizeName(x)).filter(Boolean);
-      for (const fname of friends) {
-        const ids = nameToIds.get(fname) || [];
-        if (ids.length === 1) {
-          const fid = ids[0];
-          if (fid !== e.ep_id) addEdge(e.ep_id, fid);
-        }
-      }
-    }
-
-    const visited = new Set();
-    const groups = [];
-    for (const e of EPs) {
-      const start = e.ep_id;
-      if (visited.has(start)) continue;
-      if (!adj.has(start)) continue;
-      const q = [start];
-      visited.add(start);
-      const comp = new Set();
-      while (q.length) {
-        const u = q.shift();
-        comp.add(u);
-        for (const v of (adj.get(u)||[])) {
-          if (!visited.has(v)) {
-            visited.add(v);
-            q.push(v);
-          }
-        }
-      }
-      if (comp.size >= 2) groups.push(Array.from(comp).sort());
-    }
-
-    // Build variable names
-    // x[e,l,s] binary for allowed s
-    // u[e] binary
-    // z[e] binary for first-choice indicator
-    // open[l,w] binary for never-alone hard
-    // start_single[l,s] binary for fly-alone penalty (exactly one starter at l,s)
-
-    const xVars = []; // list of {name,eid,l,sISO}
-    const xName = new Map(); // key "eid|l|sISO" -> varName
-    for (const e of EPs) {
-      for (const l of locCodes) {
-        for (const s of EP_allowed.get(e.ep_id)) {
-          const sISO = dateToISO(s);
-          const nm = safeVarName(`x_${e.ep_id}_${l}_${sISO}`);
-          xVars.push({name:nm, eid:e.ep_id, l, sISO});
-          xName.set(`${e.ep_id}|${l}|${sISO}`, nm);
-        }
-      }
-    }
-    const uName = new Map(EPs.map(e => [e.ep_id, safeVarName(`u_${e.ep_id}`)]));
-    const zName = new Map(EPs.map(e => [e.ep_id, safeVarName(`z_${e.ep_id}`)]));
-
-    const openName = new Map(); // key l|wIdx -> name
-    for (const l of locCodes) {
-      for (let w=0; w<weeks.length; w++) {
-        openName.set(`${l}|${w}`, safeVarName(`open_${l}_${w}`));
-      }
-    }
-
-    const startSingleName = new Map(); // key l|sISO -> name
-    for (const l of locCodes) {
-      for (const sISO of allMondays) {
-        startSingleName.set(`${l}|${sISO}`, safeVarName(`start_single_${l}_${sISO}`));
-      }
-    }
-
-    // Helper: starters at (l,sISO)
-    function startersAt(l, sISO) {
-      const arr = [];
-      for (const e of EPs) {
-        const nm = xName.get(`${e.ep_id}|${l}|${sISO}`);
-        if (nm) arr.push(nm);
-      }
-      return arr;
-    }
-
-    // Helper: presence vars for (l, wIdx)
-    function presenceAt(l, wIdx) {
-      const arrAll = [];
-      const arrF = [];
-      const arrM = [];
-      for (const e of EPs) {
-        for (const s of EP_allowed.get(e.ep_id)) {
-          const sISO = dateToISO(s);
-          const sIdx = weekIndex.get(sISO);
-          if (sIdx === undefined) continue;
-          if (sIdx <= wIdx && wIdx < sIdx + WEEKS_DURATION) {
-            const nm = xName.get(`${e.ep_id}|${l}|${sISO}`);
-            if (!nm) continue;
-            arrAll.push(nm);
-            if (e.gender === "F") arrF.push(nm);
-            if (e.gender === "M") arrM.push(nm);
-          }
-        }
-      }
-      return {arrAll, arrF, arrM};
-    }
-
-    // Build LP text builder
-    let lines = [];
-    function push(s){ lines.push(s); }
-
-    function linExpr(terms) {
-      // terms: array of [coef, varName]
-      // output like " + 3 x - 2 y"
-      let out = "";
-      for (const [c, v] of terms) {
-        if (c === 0) continue;
-        const sign = (c >= 0) ? "+" : "-";
-        const abs = Math.abs(c);
-        const coef = (abs === 1) ? "" : String(abs) + " ";
-        out += ` ${sign} ${coef}${v}`;
-      }
-      if (out.trim() === "") return " 0";
-      // trim leading space, keep sign
-      return out;
-    }
-
-    // Collect all binaries
-    const binaries = new Set();
-    xVars.forEach(v => binaries.add(v.name));
-    EPs.forEach(e => { binaries.add(uName.get(e.ep_id)); binaries.add(zName.get(e.ep_id)); });
-    for (const nm of openName.values()) binaries.add(nm);
-
-    // Group y vars will be added later dynamically
-    const groupYVars = [];
-
-    // Also create helper binaries for singleton start detection: o1/o2 per (l,sISO)
-    // This is needed to define start_single exactly.
-    // We add them only if there is at least one candidate starter variable at (l,s).
-    const o1Name = new Map();
-    const o2Name = new Map();
-
-    for (const l of locCodes) {
-      for (const sISO of allMondays) {
-        const head = startersAt(l, sISO);
-        if (head.length === 0) continue;
-        const o1 = safeVarName(`o1_${l}_${sISO}`);
-        const o2 = safeVarName(`o2_${l}_${sISO}`);
-        o1Name.set(`${l}|${sISO}`, o1);
-        o2Name.set(`${l}|${sISO}`, o2);
-        binaries.add(o1);
-        binaries.add(o2);
-        binaries.add(startSingleName.get(`${l}|${sISO}`));
-      }
-    }
-
-    function buildBaseModel(objectiveTerms, extraConstraints=[]) {
-      lines = [];
-      push("Maximize");
-      push(" obj:" + linExpr(objectiveTerms));
-      push("Subject To");
-
-      let c = 0;
-      function addConstraint(expr, sense, rhs) {
-        // expr is string like " x + y - 2 z"
-        c += 1;
-        push(` c${c}: ${expr.trim()} ${sense} ${rhs}`);
-      }
-
-      // Each EP: sum x + u = 1
-      for (const e of EPs) {
-        const terms = [];
-        for (const l of locCodes) {
-          for (const s of EP_allowed.get(e.ep_id)) {
-            const nm = xName.get(`${e.ep_id}|${l}|${dateToISO(s)}`);
-            if (nm) terms.push([1, nm]);
-          }
-        }
-        terms.push([1, uName.get(e.ep_id)]);
-        addConstraint(linExpr(terms), "=", 1);
-      }
-
-      // Define z[e] for first choice: sum_{s} x[e,first,s] - z[e] >= 0
-      for (const e of EPs) {
-        const first = normalizeCode(epsData.find(r => String(r.ep_id).trim()===e.ep_id).preferred_location_1);
-        if (!first || !locBy[first]) continue;
-        const terms = [];
-        for (const s of EP_allowed.get(e.ep_id)) {
-          const sISO = dateToISO(s);
-          const nm = xName.get(`${e.ep_id}|${first}|${sISO}`);
-          if (nm) terms.push([1, nm]);
-        }
-        terms.push([-1, zName.get(e.ep_id)]);
-        addConstraint(linExpr(terms), ">=", 0);
-      }
-
-      // Group constraints (same location & same start, or all unassigned)
-      for (const comp of groups) {
-        // common starts intersection
-        let common = null;
-        for (const eid of comp) {
-          const sset = new Set((EP_allowed.get(eid) || []).map(dateToISO));
-          common = (common === null) ? sset : new Set([...common].filter(x => sset.has(x)));
-        }
-        const commonStarts = Array.from(common || []).sort();
-
-        const ref = comp[0];
-
-        if (commonStarts.length === 0) {
-          // force all unassigned together (and forbid all x)
-          for (const eid of comp) {
-            for (const l of locCodes) {
-              for (const s of (EP_allowed.get(eid) || [])) {
-                const nm = xName.get(`${eid}|${l}|${dateToISO(s)}`);
-                if (nm) addConstraint(`${nm}`, "=", 0);
-              }
-            }
-            // u[eid] - u[ref] = 0
-            addConstraint(`${uName.get(eid)} - ${uName.get(ref)}`, "=", 0);
-          }
-          continue;
-        }
-
-        // create y[l,s] for common starts and tie x = y
-        const yNames = [];
-        for (const l of locCodes) {
-          for (const sISO of commonStarts) {
-            const yv = safeVarName(`y_${comp.join("_")}_${l}_${sISO}`);
-            yNames.push(yv);
-            groupYVars.push(yv);
-            binaries.add(yv);
-
-            for (const eid of comp) {
-              const xnm = xName.get(`${eid}|${l}|${sISO}`);
-              if (xnm) {
-                // x - y = 0
-                addConstraint(`${xnm} - ${yv}`, "=", 0);
-              } else {
-                // if x doesn't exist, force y=0 so model stays consistent
-                addConstraint(`${yv}`, "=", 0);
-              }
-            }
-          }
-        }
-
-        // sum y <= 1
-        addConstraint(linExpr(yNames.map(v => [1,v])), "<=", 1);
-
-        // equal u across group
-        for (const eid of comp) {
-          addConstraint(`${uName.get(eid)} - ${uName.get(ref)}`, "=", 0);
-        }
-
-        // sum y + u_ref = 1
-        addConstraint(linExpr([[1,uName.get(ref)], ...yNames.map(v => [1,v])]), "=", 1);
-      }
-
-      // Capacity + gender + never-alone hard
-      for (const l of locCodes) {
-        const capT = locBy[l].capacity_total;
-        const capF = locBy[l].cap_female_max;
-        const capM = locBy[l].cap_male_max;
-
-        for (let w=0; w<weeks.length; w++) {
-          const {arrAll, arrF, arrM} = presenceAt(l, w);
-          if (arrAll.length === 0) continue;
-
-          const H = linExpr(arrAll.map(v => [1,v]));
-          addConstraint(H, "<=", capT);
-
-          if (capF !== null && arrF.length > 0) {
-            addConstraint(linExpr(arrF.map(v => [1,v])), "<=", capF);
-          }
-          if (capM !== null && arrM.length > 0) {
-            addConstraint(linExpr(arrM.map(v => [1,v])), "<=", capM);
-          }
-
-          const open = openName.get(`${l}|${w}`);
-          // H - 2 open >= 0
-          addConstraint(linExpr([[1, ...[]][0]]), ">=", 0); // placeholder to keep structure stable (ignored)
-          // Replace with direct strings (simpler):
-          c += 1; push(` c${c}: ${H.trim()} - 2 ${open} >= 0`);
-          c += 1; push(` c${c}: ${H.trim()} - ${capT} ${open} <= 0`);
-        }
-      }
-
-      // Fly-alone singleton-start detection:
-      // y = 1 iff exactly one starter at (l,s)
-      // Hs >= o1 ; Hs <= M o1
-      // Hs >= 2 o2 ; Hs <= M o2
-      // y >= o1 - o2 ; y <= o1 ; y <= 1 - o2
-      const BIGM = 1000;
-      for (const l of locCodes) {
-        for (const sISO of allMondays) {
-          const head = startersAt(l, sISO);
-          if (head.length === 0) continue;
-
-          const Hs = linExpr(head.map(v => [1,v]));
-          const o1 = o1Name.get(`${l}|${sISO}`);
-          const o2 = o2Name.get(`${l}|${sISO}`);
-          const y = startSingleName.get(`${l}|${sISO}`);
-
-          c += 1; push(` c${c}: ${Hs.trim()} - ${o1} >= 0`);
-          c += 1; push(` c${c}: ${Hs.trim()} - ${BIGM} ${o1} <= 0`);
-
-          c += 1; push(` c${c}: ${Hs.trim()} - 2 ${o2} >= 0`);
-          c += 1; push(` c${c}: ${Hs.trim()} - ${BIGM} ${o2} <= 0`);
-
-          c += 1; push(` c${c}: ${y} - ${o1} + ${o2} >= 0`);   // y >= o1 - o2
-          c += 1; push(` c${c}: ${y} - ${o1} <= 0`);            // y <= o1
-          c += 1; push(` c${c}: ${y} + ${o2} <= 1`);            // y <= 1 - o2
-        }
-      }
-
-      // extra constraints (stage-locking)
-      for (const s of extraConstraints) push(s);
-
-      push("Bounds");
-      // binaries are implicitly 0..1, but we still add 0<=var<=1 to be safe
-      for (const v of binaries) {
-        push(` 0 <= ${v} <= 1`);
-      }
-      push("Binary");
-      for (const v of binaries) push(` ${v}`);
-      push("End");
-
-      return lines.join("\n");
-    }
-
-    // Stage 1 objective: maximize sum z
-    const stage1Obj = [];
-    for (const e of EPs) stage1Obj.push([1, zName.get(e.ep_id)]);
-
-    setStatus("Solving stage 1 (maximize first choices)…");
-    const lp1 = buildBaseModel(stage1Obj);
-    const sol1 = solveLP(lp1);
-    if (!sol1 || sol1.Status !== "Optimal") {
-      console.log(sol1);
-      showError("Stage 1 did not solve to Optimal. Check console.");
-    }
-    const cols1 = getColumns(sol1);
-    if (!cols1) {
-      console.log(sol1);
-      showError("Could not read solver column values. Check console.");
-    }
-
-    let bestFirst = 0;
-    for (const e of EPs) {
-      const z = cols1[zName.get(e.ep_id)] || 0;
-      if (z > 0.5) bestFirst += 1;
-    }
-
-    // Stage 2 objective: preference points - unassigned penalty - fly-alone penalty + small score priority
-    const stage2Obj = [];
-    for (const e of EPs) {
-      for (const l of locCodes) {
-        const sc = prefScore(epsData.find(r => String(r.ep_id).trim()===e.ep_id), l);
-        if (sc === 0) continue;
-        for (const s of EP_allowed.get(e.ep_id)) {
-          const sISO = dateToISO(s);
-          const nm = xName.get(`${e.ep_id}|${l}|${sISO}`);
-          if (nm) stage2Obj.push([sc, nm]);
-        }
-      }
-      stage2Obj.push([-PENALTY_UNASSIGNED, uName.get(e.ep_id)]);
-      stage2Obj.push([LAMBDA_SCORE * e.score, uName.get(e.ep_id)]); // +lambda*score*(1-u) == +lambda*score - lambda*score*u
-      // constant part (+lambda*score) doesn’t matter, so we only add -lambda*score*u via +lambda*score*u with negative?:
-      // easier: subtract lambda*score*u
-      stage2Obj.pop();
-      stage2Obj.push([-(LAMBDA_SCORE * e.score), uName.get(e.ep_id)]);
-    }
-    for (const [key, yVar] of startSingleName.entries()) {
-      // only penalize yVars that actually exist in binaries set (some l,s have no starters)
-      if (binaries.has(yVar)) stage2Obj.push([-START_ALONE_PENALTY, yVar]);
-    }
-
-    // Lock stage 1: sum z >= bestFirst
-    const lockLine = ` c_lock_first: ${linExpr(EPs.map(e => [1, zName.get(e.ep_id)])).trim()} >= ${bestFirst}`;
-
-    setStatus("Solving stage 2 (preferences, penalties, score)…");
-    const lp2 = buildBaseModel(stage2Obj, [lockLine]);
-    const sol2 = solveLP(lp2);
-
-    if (!sol2 || sol2.Status !== "Optimal") {
-      console.log(sol2);
-      showError("Stage 2 did not solve to Optimal. Check console.");
-    }
-    const cols2 = getColumns(sol2);
-    if (!cols2) {
-      console.log(sol2);
-      showError("Could not read solver column values. Check console.");
-    }
-
-    // Extract assignment
-    const assignments = [];
-    for (const e of EPs) {
-      let placed = null;
-
-      for (const l of locCodes) {
-        for (const s of EP_allowed.get(e.ep_id)) {
-          const sISO = dateToISO(s);
-          const nm = xName.get(`${e.ep_id}|${l}|${sISO}`);
-          if (nm && (cols2[nm] || 0) > 0.5) {
-            placed = {l, sISO};
-            break;
-          }
-        }
-        if (placed) break;
-      }
-
-      const startISO = placed ? placed.sISO : "";
-      const startDate = placed ? new Date(startISO) : null;
-      const endFridayISO = placed
-        ? dateToISO(addDays(addWeeks(startDate, WEEKS_DURATION-1), 4))
-        : "";
-
-      assignments.push({
-        ep_id: e.ep_id,
-        full_name: e.full_name,
-        gender: e.gender,
-        location: placed ? placed.l : "",
-        start_monday: startISO,
-        end_friday: endFridayISO,
-        first_choice: e.pref1
-      });
-    }
 
     downloadCSV("assignment.csv", assignments);
-    setStatus("Done ✔ assignment.csv downloaded.", "success");
-  };
+    setStatus("Solver test OK. assignment.csv downloaded. Next: plug in your real model.", "success");
+  });
 </script>
 
 </body>
