@@ -165,13 +165,28 @@
     });
   }
 
-  async function initHighs() {
-    setStatus("Loading solver (HiGHS)…");
-    highs = await highsLoader({
-      locateFile: (file) => "https://lovasoa.github.io/highs-js/" + file
-    });
+async function initHighs() {
+  setStatus("Loading solver (HiGHS)…");
+
+  const timeoutMs = 30000;
+  const timeout = new Promise((_, rej) =>
+    setTimeout(() => rej(new Error("Timed out loading HiGHS (30s). This usually happens if you opened the file as file:// instead of http://, or if a CDN is blocked.")), timeoutMs)
+  );
+
+  try {
+    highs = await Promise.race([
+      highsLoader({
+        locateFile: (file) => "https://lovasoa.github.io/highs-js/" + file
+      }),
+      timeout
+    ]);
     setStatus("Solver ready ✔ Upload files and validate.", "success");
+  } catch (e) {
+    console.error(e);
+    setStatus("ERROR: " + e.message, "error");
   }
+}
+
 
   initHighs().catch(err => {
     console.error(err);
