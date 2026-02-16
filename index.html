@@ -29,6 +29,21 @@ Locations.csv: <input type="file" id="locFile"><br><br>
 <pre id="output">Ready. Upload files, then validate.</pre>
 
 <script type="module">
+  let highs = null;
+
+async function initHighs() {
+  setStatus("Loading solver (HiGHS)…");
+
+  // IMPORTANT: use the BROWSER build from highs-js
+  const highsLoader = (await import("https://esm.sh/highs-js@1.8.0")).default;
+
+  const wasmBase = "https://lovasoa.github.io/highs-js/";
+  highs = await highsLoader({
+    locateFile: (file) => wasmBase + file
+  });
+
+  setStatus("Solver ready ✔", "success");
+}
   // ---------------- UI helpers ----------------
   const out = document.getElementById("output");
   const btnValidate = document.getElementById("btnValidate");
