@@ -23,7 +23,7 @@ EPs.csv: <input type="file" id="epsFile"><br><br>
 Locations.csv: <input type="file" id="locFile"><br><br>
 
 <button id="btnValidate">Validate</button>
-<button id="btnRun" disabled>Run Matching</button>
+<button id="btnRun">Run Matching</button>
 
 <h3>Status</h3>
 <pre id="output">Ready. Upload files, then validate.</pre>
@@ -184,6 +184,8 @@ async function initHighs() {
     setStatus("Validation successful. You can now run matching.", "success");
     btnRun.disabled = false;
   }
+  document.getElementById("btnValidate").addEventListener("click", validateFiles);
+  document.getElementById("btnRun").addEventListener("click", runMatching);
 
   // ---------------- Buttons ----------------
   btnValidate.addEventListener("click", async () => {
