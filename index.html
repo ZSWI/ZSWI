@@ -4,32 +4,59 @@
   <meta charset="utf-8" />
   <title>AIESEC Matching Tool</title>
 
+  <!-- CSV parser -->
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 
+  <!-- Pure-JS MILP solver (no WASM, no Python) -->
+  <!-- Source example shows this exact path being used successfully -->
+  <script src="https://cdn.jsdelivr.net/npm/javascript-lp-solver@0.4.24/prod/solver.js"></script>
+
   <style>
-    body { font-family: Arial; max-width: 900px; margin: 40px auto; }
-    button { padding:10px 16px; margin:10px 10px 0 0; }
+    body { font-family: Arial; max-width: 950px; margin: 40px auto; }
+    button { padding:10px 16px; margin:10px 10px 0 0; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
     .error { color: red; }
     .success { color: green; }
     pre { background:#f5f5f5; padding:15px; white-space: pre-wrap; }
-    .muted { color: #555; }
+    .row { margin: 10px 0; }
+    label { display:inline-block; width: 220px; }
+    input[type="number"] { width: 90px; }
   </style>
 </head>
+
 <body>
+  <h1>AIESEC Matching Tool</h1>
 
-<h1>AIESEC Matching Tool</h1>
+  <h3>Upload files</h3>
+  <div class="row">EPs.csv: <input type="file" id="epsFile" accept=".csv"></div>
+  <div class="row">Locations.csv: <input type="file" id="locFile" accept=".csv"></div>
 
-<h3>Upload files</h3>
-EPs.csv: <input type="file" id="epsFile"><br><br>
-Locations.csv: <input type="file" id="locFile"><br><br>
+  <h3>Parameters</h3>
+  <div class="row">
+    <label>Duration (weeks)</label>
+    <input type="number" id="weeksDuration" value="6" min="1" max="52" />
+  </div>
+  <div class="row">
+    <label>Penalty unassigned</label>
+    <input type="number" id="penaltyUnassigned" value="5000" min="0" step="1" />
+  </div>
+  <div class="row">
+    <label>Preference points (1/2/3/4)</label>
+    <input type="number" id="p1" value="1000" step="1" /> /
+    <input type="number" id="p2" value="120" step="1" /> /
+    <input type="number" id="p3" value="20" step="1" /> /
+    <input type="number" id="p4" value="0" step="1" />
+  </div>
 
-<button id="btnValidate">Validate</button>
-<button id="btnRun" disabled>Run Matching</button>
+  <div class="row">
+    <button id="btnValidate">Validate</button>
+    <button id="btnRun" disabled>Run Matching</button>
+  </div>
 
-<h3>Status</h3>
-<pre id="output">Page loaded. Solver will load automatically…</pre>
+  <h3>Status</h3>
+  <pre id="output">Ready. Upload files, then validate.</pre>
 
-<script type="module">
+<script>
   // ---------------- UI helpers ----------------
   const out = document.getElementById("output");
   const btnValidate = document.getElementById("btnValidate");
@@ -39,7 +66,6 @@ Locations.csv: <input type="file" id="locFile"><br><br>
     out.className = cls;
     out.textContent = msg;
   }
-
   function showError(msg) {
     setStatus("ERROR: " + msg, "error");
     throw new Error(msg);
@@ -66,18 +92,30 @@ Locations.csv: <input type="file" id="locFile"><br><br>
     link.click();
   }
 
+  // ---------------- Normalizers ----------------
   function normalizeCode(s) {
     return (s || "").toLowerCase().trim().replaceAll(" ", "_");
   }
+  function normalizeName(s) {
+    return (s || "").toLowerCase().trim().replace(/\s+/g, " ");
+  }
+  function normGender(s) {
+    const q = (s || "").toLowerCase().trim();
+    if (["f","female","vrouw","woman","girl","vrouwelijk"].includes(q)) return "F";
+    if (["m","male","man","boy","jongen","mannelijk"].includes(q)) return "M";
+    return "X";
+  }
 
+  // Accept yyyy-mm-dd and dd/mm/yyyy or mm/dd/yyyy
   function parseDateFlexible(str) {
     if (!str) return null;
     str = String(str).trim();
 
-    // yyyy-mm-dd
-    if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return new Date(str);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(str)) {
+      const d = new Date(str);
+      return isNaN(d) ? null : d;
+    }
 
-    // dd/mm/yyyy or mm/dd/yyyy (we accept both)
     if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(str)) {
       const [a,b,c] = str.split("/");
       const d1 = new Date(`${c}-${b}-${a}`); // dd/mm/yyyy
@@ -85,58 +123,51 @@ Locations.csv: <input type="file" id="locFile"><br><br>
       const d2 = new Date(`${c}-${a}-${b}`); // mm/dd/yyyy
       if (!isNaN(d2)) return d2;
     }
+
     return null;
+  }
+
+  // Dates helpers
+  function addDays(d, days) {
+    const x = new Date(d.getTime());
+    x.setDate(x.getDate() + days);
+    return x;
+  }
+  function addWeeks(d, w) {
+    return addDays(d, 7*w);
+  }
+  function dateToISO(d) {
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth()+1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+  }
+  function nextMonday(d) {
+    // JS: Sunday=0 ... Saturday=6. We want Monday.
+    const day = d.getDay();
+    const offset = (day === 1) ? 0 : ((8 - day) % 7);
+    return addDays(d, offset);
+  }
+  function mondaysBetween(startMonday, endMonday) {
+    const out = [];
+    let cur = new Date(startMonday.getTime());
+    while (cur <= endMonday) {
+      out.push(new Date(cur.getTime()));
+      cur = addWeeks(cur, 1);
+    }
+    return out;
+  }
+  function lastStartMondayGivenLatestEnd(latestEnd, weeksDuration) {
+    // last Monday such that start + weeksDuration weeks <= latestEnd
+    // If duration is 6 weeks: start + 6w must be <= latest_end (matching your original logic)
+    const d = addWeeks(latestEnd, -weeksDuration);
+    return nextMonday(d);
   }
 
   // ---------------- Data ----------------
   let epsData = null;
   let locData = null;
 
-  // ---------------- HiGHS loader (browser-correct) ----------------
-  // IMPORTANT: do not use esm.sh here. It can trigger Node/unenv paths.
-  // We load the browser ESM build straight from the highs-js repo via jsDelivr.
-  let highs = null;
-
-  async function ensureSolverLoaded() {
-    if (highs) return highs;
-
-    setStatus("Loading solver (HiGHS)…", "muted");
-
-    // Pin a version tag that exists in the repo.
-    // If you ever update, update BOTH URLs together.
-    const base = "https://cdn.jsdelivr.net/gh/lovasoa/highs-js@v1.8.0/build/";
-
-    try {
-      // This file name is the browser ESM build produced by highs-js.
-      // It must live next to highs.wasm.
-      const mod = await import(base + "highs.mjs");
-      const highsFactory = mod.default;
-
-      highs = await highsFactory({
-        locateFile: (file) => base + file
-      });
-
-      setStatus("Solver ready. Upload files, then validate.", "success");
-      return highs;
-    } catch (e) {
-      console.error(e);
-      // If this fails, 99% of the time it is because the file name differs in that tag
-      // or the tag changed. In that case, use the fallback plan below.
-      showError(
-        "Solver failed to load.\n\n" +
-        "Most common causes:\n" +
-        "- GitHub Pages must be opened via https (not file://)\n" +
-        "- Network blocks wasm\n" +
-        "- The version/tag path does not contain highs.mjs next to highs.wasm\n\n" +
-        "Details: " + (e?.message || e)
-      );
-    }
-  }
-
-  // Start loading right away
-  ensureSolverLoaded();
-
-  // ---------------- Validation ----------------
   function runValidation() {
     const requiredEPCols = [
       "ep_id","full_name","gender","earliest_start_date","latest_end_date",
@@ -148,23 +179,24 @@ Locations.csv: <input type="file" id="locFile"><br><br>
     const epHeaders = Object.keys(epsData?.[0] || {});
     const locHeaders = Object.keys(locData?.[0] || {});
 
-    for (const col of requiredEPCols) {
+    requiredEPCols.forEach(col => {
       if (!epHeaders.includes(col)) showError(`EPs.csv missing column "${col}"`);
-    }
-    for (const col of requiredLocCols) {
+    });
+    requiredLocCols.forEach(col => {
       if (!locHeaders.includes(col)) showError(`Locations.csv missing column "${col}"`);
-    }
+    });
 
-    // duplicates
-    const epIds = epsData.map(r => r.ep_id);
-    const dupEP = epIds.find((id, i) => epIds.indexOf(id) !== i);
+    // duplicates EP
+    const epIds = epsData.map(r => (r.ep_id || "").trim());
+    const dupEP = epIds.find((id, i) => id && epIds.indexOf(id) !== i);
     if (dupEP) showError(`Duplicate ep_id found: ${dupEP}`);
 
+    // duplicates locations
     const locCodes = locData.map(r => normalizeCode(r.loc_code));
-    const dupLoc = locCodes.find((id, i) => locCodes.indexOf(id) !== i);
+    const dupLoc = locCodes.find((id, i) => id && locCodes.indexOf(id) !== i);
     if (dupLoc) showError(`Duplicate loc_code found: ${dupLoc}`);
 
-    // dates
+    // dates + range
     epsData.forEach((row, i) => {
       const start = parseDateFlexible(row.earliest_start_date);
       const end = parseDateFlexible(row.latest_end_date);
@@ -173,24 +205,247 @@ Locations.csv: <input type="file" id="locFile"><br><br>
       if (start > end) showError(`Row ${i+2}: earliest_start_date after latest_end_date`);
     });
 
+    // preference location existence
+    const locSet = new Set(locCodes);
+    epsData.forEach((row, i) => {
+      for (let k=1;k<=4;k++) {
+        const raw = row[`preferred_location_${k}`];
+        const pref = normalizeCode(raw);
+        if (!pref) continue;
+        if (["i_dont_care","i_don't_care","idc","n/a","na","none","any"].includes(pref)) continue;
+        if (!locSet.has(pref)) showError(`Row ${i+2}: preferred_location_${k} "${raw}" not in Locations.csv`);
+      }
+    });
+
     setStatus("Validation successful. You can now run matching.", "success");
     btnRun.disabled = false;
   }
 
-  // ---------------- Button handlers ----------------
+  // ---------------- Preference scoring ----------------
+  function prefScore(epRow, locCode, PREF_POINTS) {
+    const raw = [1,2,3,4].map(k => epRow[`preferred_location_${k}`] || "");
+    const cleaned = [];
+    for (const p of raw) {
+      const q = normalizeCode(p);
+      if (!q) continue;
+      if (["i_dont_care","i_don't_care","idc","n/a","na","none","any"].includes(q)) continue;
+      cleaned.push(q);
+    }
+    const code = normalizeCode(locCode);
+    const idx = cleaned.indexOf(code);
+    if (idx >= 0) return PREF_POINTS[idx+1] ?? 0;
+    return 0;
+  }
+
+  // ---------------- Build and solve MILP ----------------
+  function buildAndSolveModel() {
+    if (!window.solver) showError("MILP solver library did not load. (solver.js missing)");
+
+    const WEEKS_DURATION = Number(document.getElementById("weeksDuration").value || 6);
+    const PENALTY_UNASSIGNED = Number(document.getElementById("penaltyUnassigned").value || 5000);
+    const PREF_POINTS = {
+      1: Number(document.getElementById("p1").value || 1000),
+      2: Number(document.getElementById("p2").value || 120),
+      3: Number(document.getElementById("p3").value || 20),
+      4: Number(document.getElementById("p4").value || 0),
+    };
+
+    // Normalize locations
+    const Locations = locData.map(r => ({
+      loc_code: normalizeCode(r.loc_code),
+      capacity_total: Number(r.capacity_total),
+      cap_female_max: (r.cap_female_max === "" || r.cap_female_max == null) ? null : Number(r.cap_female_max),
+      cap_male_max: (r.cap_male_max === "" || r.cap_male_max == null) ? null : Number(r.cap_male_max),
+      notes: r.notes || ""
+    }));
+
+    const locCodes = Locations.map(L => L.loc_code);
+    const locByCode = Object.fromEntries(Locations.map(L => [L.loc_code, L]));
+
+    // Normalize EPs and compute allowed starts
+    const EPs = epsData.map(r => {
+      const earliest = parseDateFlexible(r.earliest_start_date);
+      const latest = parseDateFlexible(r.latest_end_date);
+      return {
+        ep_id: (r.ep_id || "").trim(),
+        full_name: r.full_name || "",
+        gender: normGender(r.gender),
+        earliest_start_date: earliest,
+        latest_end_date: latest,
+        wants_pair: String(r.wants_pair || "").trim().toLowerCase() === "yes",
+        pair_with_full_name: r.pair_with_full_name || "",
+        score: isNaN(Number(String(r.score || "").replace(",", "."))) ? 0 : Number(String(r.score || "").replace(",", ".")),
+        preferred_location_1: r.preferred_location_1 || "",
+        preferred_location_2: r.preferred_location_2 || "",
+        preferred_location_3: r.preferred_location_3 || "",
+        preferred_location_4: r.preferred_location_4 || "",
+      };
+    });
+
+    const EP_allowed = new Map(); // ep_id -> [Date Mondays]
+    const allMondays = [];
+    for (const e of EPs) {
+      const startM = nextMonday(e.earliest_start_date);
+      const lastStart = lastStartMondayGivenLatestEnd(e.latest_end_date, WEEKS_DURATION);
+      const allowed = (startM <= lastStart) ? mondaysBetween(startM, lastStart) : [];
+      EP_allowed.set(e.ep_id, allowed);
+      for (const m of allowed) allMondays.push(dateToISO(m));
+    }
+    if (allMondays.length === 0) showError("No feasible Monday starts found. Check date windows.");
+
+    // We only enforce TOTAL capacity per location for each start week in this simplified version.
+    // (Your full PuLP version also had weekly occupancy. We'll add that back after this runs.)
+    const uniqueStartMondays = Array.from(new Set(allMondays)).sort();
+
+    // Model object for javascript-lp-solver
+    // Docs style: variables contain coefficients; constraints define bounds; ints marks integer vars.
+    const model = {
+      optimize: "obj",
+      opType: "max",
+      constraints: {},
+      variables: {},
+      ints: {}
+    };
+
+    // Constraint helpers
+    function ensureConstraint(name, def) {
+      if (!model.constraints[name]) model.constraints[name] = def;
+    }
+    function addCoef(varName, constraintName, coef) {
+      if (!model.variables[varName]) model.variables[varName] = { obj: 0 };
+      model.variables[varName][constraintName] = (model.variables[varName][constraintName] || 0) + coef;
+    }
+    function setObj(varName, coef) {
+      if (!model.variables[varName]) model.variables[varName] = { obj: 0 };
+      model.variables[varName].obj = (model.variables[varName].obj || 0) + coef;
+    }
+    function makeBin(varName) {
+      model.ints[varName] = 1; // integer
+      ensureConstraint(`bin_lo_${varName}`, { min: 0 });
+      ensureConstraint(`bin_hi_${varName}`, { max: 1 });
+      addCoef(varName, `bin_lo_${varName}`, 1);
+      addCoef(varName, `bin_hi_${varName}`, 1);
+    }
+
+    // Each EP: sum_x + u == 1
+    for (const e of EPs) {
+      const c = `ep_one_${e.ep_id}`;
+      ensureConstraint(c, { equal: 1 });
+
+      const uName = `u|${e.ep_id}`;
+      makeBin(uName);
+      addCoef(uName, c, 1);
+      setObj(uName, -PENALTY_UNASSIGNED);
+
+      for (const l of locCodes) {
+        for (const s of (EP_allowed.get(e.ep_id) || [])) {
+          const sISO = dateToISO(s);
+          const xName = `x|${e.ep_id}|${l}|${sISO}`;
+          makeBin(xName);
+          addCoef(xName, c, 1);
+
+          const sc = prefScore(e, l, PREF_POINTS);
+          if (sc !== 0) setObj(xName, sc);
+
+          // Very strong tie-breaker for 1st choice count, without a 2-stage solve:
+          // Add a big bonus if assigned to first choice.
+          const first = normalizeCode(e.preferred_location_1);
+          if (first && first === l) setObj(xName, 1000000);
+        }
+      }
+    }
+
+    // Capacity per (location, startMonday): number of starters <= capacity_total
+    // (This is "starter capacity". Your weekly occupancy capacity comes later.)
+    for (const l of locCodes) {
+      for (const sISO of uniqueStartMondays) {
+        const cap = locByCode[l].capacity_total;
+        const c = `cap_start_${l}_${sISO}`;
+        ensureConstraint(c, { max: cap });
+
+        for (const e of EPs) {
+          const xName = `x|${e.ep_id}|${l}|${sISO}`;
+          if (model.variables[xName]) addCoef(xName, c, 1);
+        }
+
+        // gender caps if provided
+        const capF = locByCode[l].cap_female_max;
+        if (capF != null) {
+          const cF = `capF_start_${l}_${sISO}`;
+          ensureConstraint(cF, { max: capF });
+          for (const e of EPs) {
+            if (e.gender !== "F") continue;
+            const xName = `x|${e.ep_id}|${l}|${sISO}`;
+            if (model.variables[xName]) addCoef(xName, cF, 1);
+          }
+        }
+
+        const capM = locByCode[l].cap_male_max;
+        if (capM != null) {
+          const cM = `capM_start_${l}_${sISO}`;
+          ensureConstraint(cM, { max: capM });
+          for (const e of EPs) {
+            if (e.gender !== "M") continue;
+            const xName = `x|${e.ep_id}|${l}|${sISO}`;
+            if (model.variables[xName]) addCoef(xName, cM, 1);
+          }
+        }
+      }
+    }
+
+    // Solve
+    setStatus("Solving MILP…", "");
+    const result = window.solver.Solve(model);
+    if (!result.feasible) showError("No feasible solution found (given constraints).");
+
+    // Build assignments
+    const assignments = [];
+    for (const e of EPs) {
+      let placed = null;
+
+      for (const l of locCodes) {
+        for (const s of (EP_allowed.get(e.ep_id) || [])) {
+          const sISO = dateToISO(s);
+          const xName = `x|${e.ep_id}|${l}|${sISO}`;
+          if ((result[xName] || 0) > 0.5) {
+            placed = { loc: l, startISO: sISO };
+            break;
+          }
+        }
+        if (placed) break;
+      }
+
+      let endFridayISO = "";
+      if (placed) {
+        const startDate = new Date(placed.startISO);
+        // Friday of week N = start + (N-1) weeks + 4 days
+        const endFriday = addDays(addWeeks(startDate, WEEKS_DURATION - 1), 4);
+        endFridayISO = dateToISO(endFriday);
+      }
+
+      assignments.push({
+        ep_id: e.ep_id,
+        full_name: e.full_name,
+        gender: e.gender,
+        location: placed ? placed.loc : "",
+        start_monday: placed ? placed.startISO : "",
+        end_friday: placed ? endFridayISO : "",
+        first_choice: normalizeCode(e.preferred_location_1),
+      });
+    }
+
+    return assignments;
+  }
+
+  // ---------------- Wire buttons ----------------
   btnValidate.addEventListener("click", async () => {
     const epsFile = document.getElementById("epsFile").files[0];
     const locFile = document.getElementById("locFile").files[0];
     if (!epsFile || !locFile) showError("Please upload both EPs.csv and Locations.csv");
 
-    setStatus("Reading CSV files…", "muted");
-    try {
-      epsData = await parseCSV(epsFile);
-      locData = await parseCSV(locFile);
-    } catch (e) {
-      console.error(e);
-      showError("Could not parse CSV. Check that files are valid CSV with headers.");
-    }
+    setStatus("Reading CSV files…", "");
+    epsData = await parseCSV(epsFile);
+    locData = await parseCSV(locFile);
 
     runValidation();
   });
@@ -198,42 +453,20 @@ Locations.csv: <input type="file" id="locFile"><br><br>
   btnRun.addEventListener("click", async () => {
     if (!epsData || !locData) showError("Please validate files first.");
 
-    await ensureSolverLoaded();
-
-    setStatus("Running solver test…", "muted");
-
-    // Tiny LP sanity test (proves highs.solve works)
-    const lp = `
-Maximize
- obj: x
-Subject To
- c1: x <= 1
-Bounds
- 0 <= x <= 1
-End
-`.trim();
-
-    let sol;
-    try {
-      sol = highs.solve(lp);
-    } catch (e) {
-      console.error(e);
-      showError("Solver loaded, but solve() failed: " + (e?.message || e));
-    }
-
-    // Dummy output for now, until you plug in your real model translation
-    const assignments = epsData.map(ep => ({
-      ep_id: ep.ep_id,
-      full_name: ep.full_name,
-      location: "TO_BE_COMPUTED",
-      start_monday: "TO_BE_COMPUTED",
-      end_friday: "TO_BE_COMPUTED"
-    }));
-
+    const assignments = buildAndSolveModel();
     downloadCSV("assignment.csv", assignments);
-    setStatus("Solver test OK. assignment.csv downloaded. Next: build the real MILP and solve it.", "success");
+    setStatus("Done. assignment.csv downloaded.", "success");
   });
-</script>
 
+  // Initial sanity for solver load
+  if (!window.solver) {
+    setStatus(
+      "ERROR: MILP solver did not load.\n" +
+      "If you opened via file://, switch to GitHub Pages https.\n" +
+      "If you have an adblocker, allow cdn.jsdelivr.net.\n",
+      "error"
+    );
+  }
+</script>
 </body>
 </html>
