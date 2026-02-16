@@ -19,31 +19,16 @@
 <h1>AIESEC Matching Tool</h1>
 
 <h3>Upload files</h3>
-EPs.csv: <input type="file" id="epsFile"><br><br>
-Locations.csv: <input type="file" id="locFile"><br><br>
+EPs.csv: <input type="file" id="epsFile" accept=".csv"><br><br>
+Locations.csv: <input type="file" id="locFile" accept=".csv"><br><br>
 
-<button id="btnValidate">Validate</button>
-<button id="btnRun">Run Matching</button>
+<button id="btnValidate" type="button">Validate</button>
+<button id="btnRun" type="button" disabled>Run Matching</button>
 
 <h3>Status</h3>
-<pre id="output">Ready. Upload files, then validate.</pre>
+<pre id="output">Loading solver…</pre>
 
 <script type="module">
-  let highs = null;
-
-async function initHighs() {
-  setStatus("Loading solver (HiGHS)…");
-
-  // IMPORTANT: use the BROWSER build from highs-js
-  const highsLoader = (await import("https://esm.sh/highs-js@1.8.0")).default;
-
-  const wasmBase = "https://lovasoa.github.io/highs-js/";
-  highs = await highsLoader({
-    locateFile: (file) => wasmBase + file
-  });
-
-  setStatus("Solver ready ✔", "success");
-}
   // ---------------- UI helpers ----------------
   const out = document.getElementById("output");
   const btnValidate = document.getElementById("btnValidate");
@@ -59,6 +44,7 @@ async function initHighs() {
     throw new Error(msg);
   }
 
+  // ---------------- CSV helpers ----------------
   function parseCSV(file) {
     return new Promise((resolve, reject) => {
       Papa.parse(file, {
@@ -78,8 +64,10 @@ async function initHighs() {
     if (!str) return null;
     str = String(str).trim();
 
+    // yyyy-mm-dd
     if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return new Date(str);
 
+    // dd/mm/yyyy or mm/dd/yyyy
     if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(str)) {
       const [a,b,c] = str.split("/");
       const d1 = new Date(`${c}-${b}-${a}`); // dd/mm/yyyy
@@ -103,14 +91,14 @@ async function initHighs() {
   let epsData = null;
   let locData = null;
 
-  // ---------------- HiGHS loader (fixed) ----------------
+  // ---------------- HiGHS loader (single source of truth) ----------------
   let highs = null;
-  async function loadHighsWithTimeout(ms = 60000) {
-    // highs-js is published on npm as "highs"
-    // esm.sh turns it into browser-friendly ESM.
-    const highsLoader = (await import("https://esm.sh/highs@1.8.0")).default;
 
+  async function loadHighsWithTimeout(ms = 60000) {
+    // IMPORTANT: this one worked for you before, keep it.
+    const highsLoader = (await import("https://esm.sh/highs@1.8.0")).default;
     const wasmBase = "https://lovasoa.github.io/highs-js/"; // contains highs.wasm
+
     const highsPromise = highsLoader({
       locateFile: (file) => wasmBase + file
     });
@@ -123,25 +111,26 @@ async function initHighs() {
   }
 
   async function ensureSolverLoaded() {
-    if (highs) return;
-    setStatus("Loading solver (HiGHS)…", "");
+    if (highs) return highs;
+    setStatus("Loading solver (HiGHS)…");
     try {
       highs = await loadHighsWithTimeout(60000);
-      setStatus("Solver ready. Validate your files, then run matching.", "success");
+      setStatus("Solver ready. Upload files, then validate.", "success");
+      return highs;
     } catch (e) {
       console.error(e);
       showError(
-        "Solver failed to load. Most common reasons:\n" +
-        "- You opened the file via file:// (must use https GitHub Pages URL)\n" +
-        "- A network/adblocker blocked highs.wasm\n" +
-        "- Corporate wifi blocks wasm/CDNs\n\n" +
+        "Solver failed to load.\n\nMost common reasons:\n" +
+        "- Must open via https (GitHub Pages), not file://\n" +
+        "- Network/adblocker blocked highs.wasm\n" +
+        "- Wi-Fi blocks wasm/CDNs\n\n" +
         "Details: " + (e?.message || e)
       );
     }
   }
 
-  // Start loading solver in the background after page loads
-  ensureSolverLoaded();
+  // Start loading solver on page load
+  await ensureSolverLoaded();
 
   // ---------------- Validation ----------------
   function runValidation() {
@@ -184,27 +173,32 @@ async function initHighs() {
     btnRun.disabled = false;
   }
 
-  // ---------------- Buttons ----------------
+  // ---------------- Button wiring (explicit) ----------------
   btnValidate.addEventListener("click", async () => {
-    const epsFile = document.getElementById("epsFile").files[0];
-    const locFile = document.getElementById("locFile").files[0];
-    if (!epsFile || !locFile) showError("Please upload both EPs.csv and Locations.csv");
+    try {
+      const epsFile = document.getElementById("epsFile").files[0];
+      const locFile = document.getElementById("locFile").files[0];
+      if (!epsFile || !locFile) showError("Please upload both EPs.csv and Locations.csv");
 
-    setStatus("Reading CSV files…", "");
-    epsData = await parseCSV(epsFile);
-    locData = await parseCSV(locFile);
+      setStatus("Reading CSV files…");
+      epsData = await parseCSV(epsFile);
+      locData = await parseCSV(locFile);
 
-    runValidation();
+      runValidation();
+    } catch (e) {
+      console.error(e);
+      // showError already updated UI; this just prevents silent failure
+    }
   });
 
   btnRun.addEventListener("click", async () => {
-    if (!epsData || !locData) showError("Please validate files first.");
-    await ensureSolverLoaded();
+    try {
+      if (!epsData || !locData) showError("Please validate files first.");
+      await ensureSolverLoaded();
 
-    // Pipeline test: run a tiny LP so you know the solver actually works.
-    setStatus("Running a solver test…", "");
+      setStatus("Running a solver test…");
 
-    const lp = `
+      const lp = `
 Maximize
  obj: x
 Subject To
@@ -214,27 +208,30 @@ Bounds
 End
 `.trim();
 
-    let sol;
-    try {
-      sol = highs.solve(lp);
+      try {
+        highs.solve(lp);
+      } catch (e) {
+        console.error(e);
+        showError("Solver loaded, but solve() failed: " + (e?.message || e));
+      }
+
+      // dummy output to prove download works
+      const assignments = epsData.map(ep => ({
+        ep_id: ep.ep_id,
+        full_name: ep.full_name,
+        location: "TO_BE_COMPUTED",
+        start_monday: "TO_BE_COMPUTED",
+        end_friday: "TO_BE_COMPUTED"
+      }));
+
+      downloadCSV("assignment.csv", assignments);
+      setStatus("Solver test OK. assignment.csv downloaded.", "success");
     } catch (e) {
       console.error(e);
-      showError("Solver loaded, but solve() failed: " + (e?.message || e));
     }
-
-    // TEMP: produce a dummy assignment to prove download works
-    const assignments = epsData.map(ep => ({
-      ep_id: ep.ep_id,
-      full_name: ep.full_name,
-      location: "TO_BE_COMPUTED",
-      start_monday: "TO_BE_COMPUTED",
-      end_friday: "TO_BE_COMPUTED"
-    }));
-
-    downloadCSV("assignment.csv", assignments);
-    setStatus("Solver test OK. assignment.csv downloaded. Next: plug in your real model.", "success");
   });
 </script>
 
 </body>
 </html>
+
