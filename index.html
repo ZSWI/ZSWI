@@ -96,6 +96,21 @@
   function normalizeCode(s) {
     return (s || "").toLowerCase().trim().replaceAll(" ", "_");
   }
+  function isNoPreference(raw) {
+    const p = normalizeCode(raw);
+    return (
+      !p ||
+      [
+        "i_dont_care", "i_don't_care", "idc",
+        "dont_care", "don't_care",
+        "doesnt_care", "doesn't_care",
+        "does_not_matter", "doesnt_matter", "doesn't_matter",
+        "no_preference", "no_pref", "any",
+        "n/a", "na", "none", "-"
+      ].includes(p)
+    );
+  }
+
   function normalizeName(s) {
     return (s || "").toLowerCase().trim().replace(/\s+/g, " ");
   }
@@ -210,9 +225,8 @@
     epsData.forEach((row, i) => {
       for (let k=1;k<=4;k++) {
         const raw = row[`preferred_location_${k}`];
+        if (isNoPreference(raw)) continue;
         const pref = normalizeCode(raw);
-        if (!pref) continue;
-        if (["i_dont_care","i_don't_care","idc","n/a","na","none","any"].includes(pref)) continue;
         if (!locSet.has(pref)) showError(`Row ${i+2}: preferred_location_${k} "${raw}" not in Locations.csv`);
       }
     });
