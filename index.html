@@ -184,8 +184,6 @@ async function initHighs() {
     setStatus("Validation successful. You can now run matching.", "success");
     btnRun.disabled = false;
   }
-  document.getElementById("btnValidate").addEventListener("click", validateFiles);
-  document.getElementById("btnRun").addEventListener("click", runMatching);
 
   // ---------------- Buttons ----------------
   btnValidate.addEventListener("click", async () => {
