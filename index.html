@@ -7,19 +7,21 @@
   <!-- CSV parser -->
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 
-  <!-- Pure-JS MILP solver (no WASM, no Python) -->
+  <!-- Pure-JS MILP solver -->
   <script src="https://cdn.jsdelivr.net/npm/javascript-lp-solver@0.4.24/prod/solver.js"></script>
 
   <style>
-    body { font-family: Arial; max-width: 950px; margin: 40px auto; }
+    body { font-family: Arial; max-width: 980px; margin: 40px auto; }
     button { padding:10px 16px; margin:10px 10px 0 0; cursor: pointer; }
     button:disabled { opacity: .5; cursor: not-allowed; }
     .error { color: red; }
     .success { color: green; }
     pre { background:#f5f5f5; padding:15px; white-space: pre-wrap; }
     .row { margin: 10px 0; }
-    label { display:inline-block; width: 220px; }
+    label { display:inline-block; width: 260px; vertical-align: middle; }
     input[type="number"] { width: 90px; }
+    .hint { font-size: 12px; opacity: .75; margin-left: 260px; margin-top: 4px; }
+    .box { padding: 12px; background: #fafafa; border: 1px solid #eee; border-radius: 8px; }
   </style>
 </head>
 
@@ -31,24 +33,47 @@
   <div class="row">Locations.csv: <input type="file" id="locFile" accept=".csv"></div>
 
   <h3>Parameters</h3>
-  <div class="row">
-    <label>Duration (weeks)</label>
-    <input type="number" id="weeksDuration" value="6" min="1" max="52" />
+  <div class="box">
+    <div class="row">
+      <label>Duration (weeks)</label>
+      <input type="number" id="weeksDuration" value="6" min="1" max="52" />
+    </div>
+    <div class="row">
+      <label>Penalty unassigned</label>
+      <input type="number" id="penaltyUnassigned" value="5000" min="0" step="1" />
+    </div>
+    <div class="row">
+      <label>Preference points (1/2/3/4)</label>
+      <input type="number" id="p1" value="1000" step="1" /> /
+      <input type="number" id="p2" value="120" step="1" /> /
+      <input type="number" id="p3" value="20" step="1" /> /
+      <input type="number" id="p4" value="0" step="1" />
+    </div>
+    <div class="row">
+      <label>Score weight (tie-breaker)</label>
+      <input type="number" id="lambdaScore" value="5" min="0" step="1" />
+    </div>
   </div>
-  <div class="row">
-    <label>Penalty unassigned</label>
-    <input type="number" id="penaltyUnassigned" value="5000" min="0" step="1" />
-  </div>
-  <div class="row">
-    <label>Preference points (1/2/3/4)</label>
-    <input type="number" id="p1" value="1000" step="1" /> /
-    <input type="number" id="p2" value="120" step="1" /> /
-    <input type="number" id="p3" value="20" step="1" /> /
-    <input type="number" id="p4" value="0" step="1" />
-  </div>
-  <div class="row">
-    <label>Score weight (tie-breaker)</label>
-    <input type="number" id="lambdaScore" value="5" min="0" step="1" />
+
+  <h3>Constraint switches</h3>
+  <div class="box">
+    <div class="row">
+      <label>Allow solo starts</label>
+      <input type="checkbox" id="allowSoloStarts" />
+    </div>
+    <div class="hint">If unchecked: forbids exactly 1 starter per (location, start Monday). Must be 0 or ≥2.</div>
+
+    <div class="row">
+      <label>Allow solo weeks</label>
+      <input type="checkbox" id="allowSoloWeeks" />
+    </div>
+    <div class="hint">If unchecked: forbids weeks where exactly 1 person is present at a location. Must be 0 or ≥2 each week.</div>
+
+    <div class="row">
+      <label>Allow friends to be split</label>
+      <input type="checkbox" id="allowFriendsSeparate" />
+    </div>
+    <div class="hint">If unchecked: friends must have same location + same start (or all unassigned).</div>
   </div>
 
   <div class="row">
@@ -176,7 +201,6 @@
     return out;
   }
   function lastStartMondayGivenLatestEnd(latestEnd, weeksDuration) {
-    // last Monday such that start + weeksDuration weeks <= latestEnd
     const d = addWeeks(latestEnd, -weeksDuration);
     return nextMonday(d);
   }
@@ -255,7 +279,6 @@
 
   // ---------------- Friends: build groups (connected components) ----------------
   function buildFriendGroups(EPs) {
-    // map normalized full_name -> ep_id(s)
     const nameToIds = new Map();
     for (const e of EPs) {
       const nm = normalizeName(e.full_name);
@@ -263,7 +286,6 @@
       nameToIds.get(nm).push(e.ep_id);
     }
 
-    // build undirected edges by parsing comma-separated names
     const adj = new Map();
     function addEdge(a, b) {
       if (!adj.has(a)) adj.set(a, new Set());
@@ -278,11 +300,9 @@
       for (const fn of raw) {
         const ids = nameToIds.get(fn) || [];
         if (ids.length === 1 && ids[0] !== e.ep_id) addEdge(e.ep_id, ids[0]);
-        // if 0 or ambiguous, we ignore here (validation can catch missing)
       }
     }
 
-    // connected components of adj
     const visited = new Set();
     const groups = [];
     for (const e of EPs) {
@@ -322,6 +342,10 @@
       4: Number(document.getElementById("p4").value || 0),
     };
 
+    const allowSoloStarts = document.getElementById("allowSoloStarts").checked;
+    const allowSoloWeeks = document.getElementById("allowSoloWeeks").checked;
+    const allowFriendsSeparate = document.getElementById("allowFriendsSeparate").checked;
+
     // Normalize locations
     const Locations = locData.map(r => ({
       loc_code: normalizeCode(r.loc_code),
@@ -356,26 +380,33 @@
     });
 
     const EP_allowed = new Map(); // ep_id -> [Date Mondays]
-    const allMondaysISO = [];
+    const allStartMondaysISO = [];
     for (const e of EPs) {
       const startM = nextMonday(e.earliest_start_date);
       const lastStart = lastStartMondayGivenLatestEnd(e.latest_end_date, WEEKS_DURATION);
       const allowed = (startM <= lastStart) ? mondaysBetween(startM, lastStart) : [];
       EP_allowed.set(e.ep_id, allowed);
-      for (const m of allowed) allMondaysISO.push(dateToISO(m));
+      for (const m of allowed) allStartMondaysISO.push(dateToISO(m));
     }
-    if (allMondaysISO.length === 0) showError("No feasible Monday starts found. Check date windows.");
+    if (allStartMondaysISO.length === 0) showError("No feasible Monday starts found. Check date windows.");
 
-    const uniqueStartMondays = Array.from(new Set(allMondaysISO)).sort();
+    const uniqueStartMondays = Array.from(new Set(allStartMondaysISO)).sort();
 
-    // ---------------- Model object for javascript-lp-solver ----------------
-    const model = {
-      optimize: "obj",
-      opType: "max",
-      constraints: {},
-      variables: {},
-      ints: {}
-    };
+    // Build global weeks grid (Mondays) for weekly capacity and solo-week rule
+    // weeks from minStart to maxStart + (duration-1) weeks
+    const minStartISO = uniqueStartMondays[0];
+    const maxStartISO = uniqueStartMondays[uniqueStartMondays.length - 1];
+    const minStartDate = new Date(minStartISO);
+    const maxStartDate = new Date(maxStartISO);
+    const maxWeekMonday = addWeeks(maxStartDate, WEEKS_DURATION - 1);
+
+    const weeks = mondaysBetween(minStartDate, maxWeekMonday); // array of Date mondays
+    const weeksISO = weeks.map(dateToISO);
+    const weekIndex = new Map();
+    weeksISO.forEach((iso, i) => weekIndex.set(iso, i));
+
+    // ---------------- Model object ----------------
+    const model = { optimize: "obj", opType: "max", constraints: {}, variables: {}, ints: {} };
 
     function ensureConstraint(name, def) {
       if (!model.constraints[name]) model.constraints[name] = def;
@@ -396,8 +427,15 @@
       addCoef(varName, `bin_hi_${varName}`, 1);
     }
 
-    // ---------------- Decision vars x and u ----------------
-    // Each EP: sum_x + u == 1
+    // helper: does week w include someone who started at sISO?
+    function occupiesWeek(startISO, weekISO) {
+      const si = weekIndex.get(startISO);
+      const wi = weekIndex.get(weekISO);
+      if (si == null || wi == null) return false;
+      return (si <= wi && wi < si + WEEKS_DURATION);
+    }
+
+    // ---------------- Variables + EP assignment constraints ----------------
     for (const e of EPs) {
       const c = `ep_one_${e.ep_id}`;
       ensureConstraint(c, { equal: 1 });
@@ -414,173 +452,205 @@
           makeBin(xName);
           addCoef(xName, c, 1);
 
-          // preference points
           const sc = prefScore(e, l, PREF_POINTS);
           if (sc !== 0) setObj(xName, sc);
 
-          // lexicographic-ish: big bonus for first choice
           const first = normalizeCode(e.preferred_location_1);
           if (first && first === l) setObj(xName, 1000000);
 
-          // score tie-breaker (only matters when other stuff ties)
           setObj(xName, LAMBDA_SCORE * e.score);
         }
       }
     }
 
-    // ---------------- Friend groups: same (l,s) or all unassigned ----------------
-    const groups = buildFriendGroups(EPs);
+    // ---------------- Friends constraint (optional) ----------------
+    if (!allowFriendsSeparate) {
+      const groups = buildFriendGroups(EPs);
 
-    for (let gi = 0; gi < groups.length; gi++) {
-      const comp = groups[gi];
+      for (let gi = 0; gi < groups.length; gi++) {
+        const comp = groups[gi];
 
-      // common starts = intersection of allowed starts (ISO)
-      let common = null;
-      for (const eid of comp) {
-        const arr = (EP_allowed.get(eid) || []).map(dateToISO);
-        const set = new Set(arr);
-        common = (common == null) ? set : new Set([...common].filter(x => set.has(x)));
-      }
-      const commonStarts = Array.from(common || []).sort();
-
-      // if no common start: force all unassigned together
-      if (commonStarts.length === 0) {
-        const ref = comp[0];
+        // common starts intersection (ISO)
+        let common = null;
         for (const eid of comp) {
-          // u[eid] == u[ref]
-          const eq = `grp_u_eq_${gi}_${eid}`;
-          ensureConstraint(eq, { equal: 0 });
-          addCoef(`u|${eid}`, eq, 1);
-          addCoef(`u|${ref}`, eq, -1);
+          const arr = (EP_allowed.get(eid) || []).map(dateToISO);
+          const set = new Set(arr);
+          common = (common == null) ? set : new Set([...common].filter(x => set.has(x)));
+        }
+        const commonStarts = Array.from(common || []).sort();
+        const ref = comp[0];
 
-          // forbid all x for that eid
-          for (const l of locCodes) {
-            for (const s of (EP_allowed.get(eid) || [])) {
-              const sISO = dateToISO(s);
+        if (commonStarts.length === 0) {
+          // force all unassigned together + forbid all x
+          for (const eid of comp) {
+            const eq = `grp_u_eq_${gi}_${eid}`;
+            ensureConstraint(eq, { equal: 0 });
+            addCoef(`u|${eid}`, eq, 1);
+            addCoef(`u|${ref}`, eq, -1);
+
+            for (const l of locCodes) {
+              for (const s of (EP_allowed.get(eid) || [])) {
+                const sISO = dateToISO(s);
+                const xName = `x|${eid}|${l}|${sISO}`;
+                if (!model.variables[xName]) continue;
+                const forbid = `grp_forbid_${gi}_${eid}_${l}_${sISO}`;
+                ensureConstraint(forbid, { equal: 0 });
+                addCoef(xName, forbid, 1);
+              }
+            }
+          }
+          continue;
+        }
+
+        // y vars and ties
+        const yNames = [];
+        for (const l of locCodes) {
+          for (const sISO of commonStarts) {
+            const y = `y|g${gi}|${l}|${sISO}`;
+            makeBin(y);
+            yNames.push(y);
+
+            for (const eid of comp) {
               const xName = `x|${eid}|${l}|${sISO}`;
               if (!model.variables[xName]) continue;
-              const forbid = `grp_forbid_${gi}_${eid}_${l}_${sISO}`;
-              ensureConstraint(forbid, { equal: 0 });
-              addCoef(xName, forbid, 1);
+              const eq = `grp_x_eq_${gi}_${eid}_${l}_${sISO}`;
+              ensureConstraint(eq, { equal: 0 });
+              addCoef(xName, eq, 1);
+              addCoef(y, eq, -1);
             }
           }
         }
-        continue;
-      }
 
-      // Create group choice vars y[gi,l,s] for l in locCodes and s in commonStarts
-      const yNames = [];
-      for (const l of locCodes) {
-        for (const sISO of commonStarts) {
-          const y = `y|g${gi}|${l}|${sISO}`;
-          makeBin(y);
-          yNames.push(y);
-
-          // tie every member: x[eid,l,s] == y
-          for (const eid of comp) {
-            const xName = `x|${eid}|${l}|${sISO}`;
-            if (!model.variables[xName]) continue;
-            const eq = `grp_x_eq_${gi}_${eid}_${l}_${sISO}`;
-            ensureConstraint(eq, { equal: 0 });
-            addCoef(xName, eq, 1);
-            addCoef(y, eq, -1);
-          }
+        // u equal across group
+        for (const eid of comp) {
+          const eq = `grp_u_eq2_${gi}_${eid}`;
+          ensureConstraint(eq, { equal: 0 });
+          addCoef(`u|${eid}`, eq, 1);
+          addCoef(`u|${ref}`, eq, -1);
         }
+
+        // choose exactly one placement or unassigned: sum_y + u_ref == 1
+        const choice = `grp_choice_${gi}`;
+        ensureConstraint(choice, { equal: 1 });
+        for (const y of yNames) addCoef(y, choice, 1);
+        addCoef(`u|${ref}`, choice, 1);
       }
-
-      // One (l,s) for group: sum_y + u_ref == 1, and u equal across group
-      const ref = comp[0];
-
-      // u[eid] == u[ref]
-      for (const eid of comp) {
-        const eq = `grp_u_eq2_${gi}_${eid}`;
-        ensureConstraint(eq, { equal: 0 });
-        addCoef(`u|${eid}`, eq, 1);
-        addCoef(`u|${ref}`, eq, -1);
-      }
-
-      const choice = `grp_choice_${gi}`;
-      ensureConstraint(choice, { equal: 1 });
-      for (const y of yNames) addCoef(y, choice, 1);
-      addCoef(`u|${ref}`, choice, 1);
     }
 
-    // ---------------- Capacity per (location, startMonday) ----------------
+    // ---------------- Weekly capacity (REAL capacity constraint) ----------------
+    // For each (location, week), occupancy <= capacity_total
+    // Also apply gender caps per week, like your Python version.
     for (const l of locCodes) {
-      for (const sISO of uniqueStartMondays) {
-        const cap = locByCode[l].capacity_total;
-        const c = `cap_start_${l}_${sISO}`;
+      const cap = locByCode[l].capacity_total;
+      const capF = locByCode[l].cap_female_max;
+      const capM = locByCode[l].cap_male_max;
+
+      for (const wISO of weeksISO) {
+        const c = `cap_week_${l}_${wISO}`;
         ensureConstraint(c, { max: cap });
 
+        const cF = (capF != null) ? `capF_week_${l}_${wISO}` : null;
+        const cM = (capM != null) ? `capM_week_${l}_${wISO}` : null;
+        if (cF) ensureConstraint(cF, { max: capF });
+        if (cM) ensureConstraint(cM, { max: capM });
+
+        // add all x that occupy this week
         for (const e of EPs) {
-          const xName = `x|${e.ep_id}|${l}|${sISO}`;
-          if (model.variables[xName]) addCoef(xName, c, 1);
-        }
+          for (const s of (EP_allowed.get(e.ep_id) || [])) {
+            const sISO = dateToISO(s);
+            if (!occupiesWeek(sISO, wISO)) continue;
 
-        // gender caps if provided
-        const capF = locByCode[l].cap_female_max;
-        if (capF != null) {
-          const cF = `capF_start_${l}_${sISO}`;
-          ensureConstraint(cF, { max: capF });
-          for (const e of EPs) {
-            if (e.gender !== "F") continue;
             const xName = `x|${e.ep_id}|${l}|${sISO}`;
-            if (model.variables[xName]) addCoef(xName, cF, 1);
-          }
-        }
+            if (!model.variables[xName]) continue;
 
-        const capM = locByCode[l].cap_male_max;
-        if (capM != null) {
-          const cM = `capM_start_${l}_${sISO}`;
-          ensureConstraint(cM, { max: capM });
-          for (const e of EPs) {
-            if (e.gender !== "M") continue;
-            const xName = `x|${e.ep_id}|${l}|${sISO}`;
-            if (model.variables[xName]) addCoef(xName, cM, 1);
+            addCoef(xName, c, 1);
+            if (cF && e.gender === "F") addCoef(xName, cF, 1);
+            if (cM && e.gender === "M") addCoef(xName, cM, 1);
           }
         }
       }
     }
 
-    // ---------------- No one flies alone: for each (l,s) starters is 0 or >=2 ----------------
-    // Use binary open var o[l,s]:
-    // sum_x >= 2 * o
-    // sum_x <= cap * o
-    // This forbids sum_x == 1.
-    for (const l of locCodes) {
-      for (const sISO of uniqueStartMondays) {
-        // collect starters
-        const starterVars = [];
-        for (const e of EPs) {
-          const xName = `x|${e.ep_id}|${l}|${sISO}`;
-          if (model.variables[xName]) starterVars.push(xName);
-        }
-        if (starterVars.length === 0) continue;
-
+    // ---------------- No solo weeks (optional) ----------------
+    // If OFF: for each (l,w) occupancy is 0 or >=2.
+    if (!allowSoloWeeks) {
+      for (const l of locCodes) {
         const cap = locByCode[l].capacity_total;
-        const o = `open|${l}|${sISO}`;
-        makeBin(o);
 
-        // sum_x - 2*o >= 0
-        const cMin = `noSolo_min_${l}_${sISO}`;
-        ensureConstraint(cMin, { min: 0 });
-        for (const xName of starterVars) addCoef(xName, cMin, 1);
-        addCoef(o, cMin, -2);
+        for (const wISO of weeksISO) {
+          // collect x that occupy this week
+          const occVars = [];
+          for (const e of EPs) {
+            for (const s of (EP_allowed.get(e.ep_id) || [])) {
+              const sISO = dateToISO(s);
+              if (!occupiesWeek(sISO, wISO)) continue;
+              const xName = `x|${e.ep_id}|${l}|${sISO}`;
+              if (model.variables[xName]) occVars.push(xName);
+            }
+          }
+          if (occVars.length === 0) continue;
 
-        // sum_x - cap*o <= 0
-        const cMax = `noSolo_max_${l}_${sISO}`;
-        ensureConstraint(cMax, { max: 0 });
-        for (const xName of starterVars) addCoef(xName, cMax, 1);
-        addCoef(o, cMax, -cap);
+          const o = `openW|${l}|${wISO}`;
+          makeBin(o);
+
+          // sum_occ - 2*o >= 0
+          const cMin = `noSoloW_min_${l}_${wISO}`;
+          ensureConstraint(cMin, { min: 0 });
+          for (const xName of occVars) addCoef(xName, cMin, 1);
+          addCoef(o, cMin, -2);
+
+          // sum_occ - cap*o <= 0
+          const cMax = `noSoloW_max_${l}_${wISO}`;
+          ensureConstraint(cMax, { max: 0 });
+          for (const xName of occVars) addCoef(xName, cMax, 1);
+          addCoef(o, cMax, -cap);
+        }
       }
     }
 
-    // Solve
-    setStatus("Solving MILP…", "");
-    const result = window.solver.Solve(model);
-    if (!result.feasible) showError("No feasible solution found (given constraints).");
+    // ---------------- No solo starts (optional) ----------------
+    // If OFF: for each (l, startMonday) starters is 0 or >=2
+    if (!allowSoloStarts) {
+      for (const l of locCodes) {
+        const cap = locByCode[l].capacity_total;
 
-    // Build assignments
+        for (const sISO of uniqueStartMondays) {
+          const starterVars = [];
+          for (const e of EPs) {
+            const xName = `x|${e.ep_id}|${l}|${sISO}`;
+            if (model.variables[xName]) starterVars.push(xName);
+          }
+          if (starterVars.length === 0) continue;
+
+          const o = `openS|${l}|${sISO}`;
+          makeBin(o);
+
+          // sum_start - 2*o >= 0
+          const cMin = `noSoloS_min_${l}_${sISO}`;
+          ensureConstraint(cMin, { min: 0 });
+          for (const xName of starterVars) addCoef(xName, cMin, 1);
+          addCoef(o, cMin, -2);
+
+          // sum_start - cap*o <= 0
+          const cMax = `noSoloS_max_${l}_${sISO}`;
+          ensureConstraint(cMax, { max: 0 });
+          for (const xName of starterVars) addCoef(xName, cMax, 1);
+          addCoef(o, cMax, -cap);
+        }
+      }
+    }
+
+    // ---------------- Solve ----------------
+    setStatus("Solving…", "");
+    const result = window.solver.Solve(model);
+    if (!result.feasible) {
+      showError(
+        "No feasible solution found.\n" +
+        "Try enabling one of the switches (solo starts / solo weeks / friends can split) or increase capacity."
+      );
+    }
+
+    // ---------------- Build output ----------------
     const assignments = [];
     for (const e of EPs) {
       let placed = null;
