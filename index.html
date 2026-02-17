@@ -249,11 +249,19 @@
   const out = document.getElementById("output");
   const btnValidate = document.getElementById("btnValidate");
   const btnRun = document.getElementById("btnRun");
-
+  const dot = document.getElementById("dot");
+  const statusText = document.getElementById("statusText");
+  
   function setStatus(msg, cls="") {
     out.className = cls;
     out.textContent = msg;
+  
+    if (statusText) statusText.textContent = cls === "error" ? "Error" : (cls === "success" ? "OK" : "Working");
+    if (dot) {
+      dot.className = "dot" + (cls === "error" ? " bad" : cls === "success" ? " good" : "");
+    }
   }
+
   function showError(msg) {
     setStatus("ERROR: " + msg, "error");
     throw new Error(msg);
