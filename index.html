@@ -8,7 +8,6 @@
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 
   <!-- Pure-JS MILP solver (no WASM, no Python) -->
-  <!-- Source example shows this exact path being used successfully -->
   <script src="https://cdn.jsdelivr.net/npm/javascript-lp-solver@0.4.24/prod/solver.js"></script>
 
   <style>
@@ -110,10 +109,6 @@
       ].includes(p)
     );
   }
-
-  function normalizeName(s) {
-    return (s || "").toLowerCase().trim().replace(/\s+/g, " ");
-  }
   function normGender(s) {
     const q = (s || "").toLowerCase().trim();
     if (["f","female","vrouw","woman","girl","vrouwelijk"].includes(q)) return "F";
@@ -158,7 +153,7 @@
     return `${yyyy}-${mm}-${dd}`;
   }
   function nextMonday(d) {
-    // JS: Sunday=0 ... Saturday=6. We want Monday.
+    // JS: Sunday=0 ... Saturday=6. We want Monday=1.
     const day = d.getDay();
     const offset = (day === 1) ? 0 : ((8 - day) % 7);
     return addDays(d, offset);
@@ -173,8 +168,7 @@
     return out;
   }
   function lastStartMondayGivenLatestEnd(latestEnd, weeksDuration) {
-    // last Monday such that start + weeksDuration weeks <= latestEnd
-    // If duration is 6 weeks: start + 6w must be <= latest_end (matching your original logic)
+    // match your python: last Monday such that start + weeksDuration weeks <= latest_end
     const d = addWeeks(latestEnd, -weeksDuration);
     return nextMonday(d);
   }
@@ -201,17 +195,14 @@
       if (!locHeaders.includes(col)) showError(`Locations.csv missing column "${col}"`);
     });
 
-    // duplicates EP
     const epIds = epsData.map(r => (r.ep_id || "").trim());
     const dupEP = epIds.find((id, i) => id && epIds.indexOf(id) !== i);
     if (dupEP) showError(`Duplicate ep_id found: ${dupEP}`);
 
-    // duplicates locations
     const locCodes = locData.map(r => normalizeCode(r.loc_code));
     const dupLoc = locCodes.find((id, i) => id && locCodes.indexOf(id) !== i);
     if (dupLoc) showError(`Duplicate loc_code found: ${dupLoc}`);
 
-    // dates + range
     epsData.forEach((row, i) => {
       const start = parseDateFlexible(row.earliest_start_date);
       const end = parseDateFlexible(row.latest_end_date);
@@ -220,7 +211,6 @@
       if (start > end) showError(`Row ${i+2}: earliest_start_date after latest_end_date`);
     });
 
-    // preference location existence
     const locSet = new Set(locCodes);
     epsData.forEach((row, i) => {
       for (let k=1;k<=4;k++) {
@@ -240,10 +230,9 @@
     const raw = [1,2,3,4].map(k => epRow[`preferred_location_${k}`] || "");
     const cleaned = [];
     for (const p of raw) {
+      if (isNoPreference(p)) continue;
       const q = normalizeCode(p);
-      if (!q) continue;
-      if (["i_dont_care","i_don't_care","idc","n/a","na","none","any"].includes(q)) continue;
-      cleaned.push(q);
+      if (q) cleaned.push(q);
     }
     const code = normalizeCode(locCode);
     const idx = cleaned.indexOf(code);
@@ -253,7 +242,7 @@
 
   // ---------------- Build and solve MILP ----------------
   function buildAndSolveModel() {
-    if (!window.solver) showError("MILP solver library did not load. (solver.js missing)");
+    if (!window.solver) showError("MILP solver library did not load (solver.js).");
 
     const WEEKS_DURATION = Number(document.getElementById("weeksDuration").value || 6);
     const PENALTY_UNASSIGNED = Number(document.getElementById("penaltyUnassigned").value || 5000);
@@ -272,11 +261,10 @@
       cap_male_max: (r.cap_male_max === "" || r.cap_male_max == null) ? null : Number(r.cap_male_max),
       notes: r.notes || ""
     }));
-
     const locCodes = Locations.map(L => L.loc_code);
     const locByCode = Object.fromEntries(Locations.map(L => [L.loc_code, L]));
 
-    // Normalize EPs and compute allowed starts
+    // Normalize EPs
     const EPs = epsData.map(r => {
       const earliest = parseDateFlexible(r.earliest_start_date);
       const latest = parseDateFlexible(r.latest_end_date);
@@ -296,6 +284,7 @@
       };
     });
 
+    // Allowed Monday starts per EP (like python)
     const EP_allowed = new Map(); // ep_id -> [Date Mondays]
     const allMondays = [];
     for (const e of EPs) {
@@ -303,16 +292,18 @@
       const lastStart = lastStartMondayGivenLatestEnd(e.latest_end_date, WEEKS_DURATION);
       const allowed = (startM <= lastStart) ? mondaysBetween(startM, lastStart) : [];
       EP_allowed.set(e.ep_id, allowed);
-      for (const m of allowed) allMondays.push(dateToISO(m));
+      for (const m of allowed) allMondays.push(new Date(m.getTime()));
     }
     if (allMondays.length === 0) showError("No feasible Monday starts found. Check date windows.");
 
-    // We only enforce TOTAL capacity per location for each start week in this simplified version.
-    // (Your full PuLP version also had weekly occupancy. We'll add that back after this runs.)
-    const uniqueStartMondays = Array.from(new Set(allMondays)).sort();
+    // Global weeks grid (Mondays) like python
+    const minM = new Date(Math.min(...allMondays.map(d => d.getTime())));
+    const maxAllowedStart = new Date(Math.max(...allMondays.map(d => d.getTime())));
+    const maxM = addWeeks(maxAllowedStart, WEEKS_DURATION - 1);
+    const weeks = mondaysBetween(minM, maxM); // list of Mondays
+    const weekIndex = new Map(weeks.map((d, i) => [dateToISO(d), i]));
 
-    // Model object for javascript-lp-solver
-    // Docs style: variables contain coefficients; constraints define bounds; ints marks integer vars.
+    // Build model
     const model = {
       optimize: "obj",
       opType: "max",
@@ -321,7 +312,6 @@
       ints: {}
     };
 
-    // Constraint helpers
     function ensureConstraint(name, def) {
       if (!model.constraints[name]) model.constraints[name] = def;
     }
@@ -329,110 +319,138 @@
       if (!model.variables[varName]) model.variables[varName] = { obj: 0 };
       model.variables[varName][constraintName] = (model.variables[varName][constraintName] || 0) + coef;
     }
-    function setObj(varName, coef) {
+    function addObj(varName, coef) {
       if (!model.variables[varName]) model.variables[varName] = { obj: 0 };
       model.variables[varName].obj = (model.variables[varName].obj || 0) + coef;
     }
     function makeBin(varName) {
-      model.ints[varName] = 1; // integer
+      model.ints[varName] = 1;
       ensureConstraint(`bin_lo_${varName}`, { min: 0 });
       ensureConstraint(`bin_hi_${varName}`, { max: 1 });
       addCoef(varName, `bin_lo_${varName}`, 1);
       addCoef(varName, `bin_hi_${varName}`, 1);
     }
 
-    // Each EP: sum_x + u == 1
+    // Create x variables for all feasible (ep,loc,start)
+    // Also store for quick iteration
+    const xVars = []; // {eid, l, sISO, varName}
     for (const e of EPs) {
-      const c = `ep_one_${e.ep_id}`;
-      ensureConstraint(c, { equal: 1 });
-
-      const uName = `u|${e.ep_id}`;
-      makeBin(uName);
-      addCoef(uName, c, 1);
-      setObj(uName, -PENALTY_UNASSIGNED);
-
+      const eid = e.ep_id;
       for (const l of locCodes) {
-        for (const s of (EP_allowed.get(e.ep_id) || [])) {
+        for (const s of (EP_allowed.get(eid) || [])) {
           const sISO = dateToISO(s);
-          const xName = `x|${e.ep_id}|${l}|${sISO}`;
-          makeBin(xName);
-          addCoef(xName, c, 1);
+          const varName = `x|${eid}|${l}|${sISO}`;
+          makeBin(varName);
+          xVars.push({ eid, l, sISO, varName });
 
+          // preference points
           const sc = prefScore(e, l, PREF_POINTS);
-          if (sc !== 0) setObj(xName, sc);
+          if (sc) addObj(varName, sc);
 
-          // Very strong tie-breaker for 1st choice count, without a 2-stage solve:
-          // Add a big bonus if assigned to first choice.
+          // big bonus for first choice to mimic Stage-1 tie-break
           const first = normalizeCode(e.preferred_location_1);
-          if (first && first === l) setObj(xName, 1000000);
+          if (first && first === l) addObj(varName, 1000000);
         }
       }
     }
 
-    // Capacity per (location, startMonday): number of starters <= capacity_total
-    // (This is "starter capacity". Your weekly occupancy capacity comes later.)
+    // Each EP exactly one outcome: sum_x + u == 1
+    for (const e of EPs) {
+      const eid = e.ep_id;
+      const c = `ep_one_${eid}`;
+      ensureConstraint(c, { equal: 1 });
+
+      const uName = `u|${eid}`;
+      makeBin(uName);
+      addCoef(uName, c, 1);
+      addObj(uName, -PENALTY_UNASSIGNED);
+
+      for (const xv of xVars) {
+        if (xv.eid === eid) addCoef(xv.varName, c, 1);
+      }
+    }
+
+    // Weekly occupancy constraints (the missing part!)
+    // For each location l and week w: headcount present that week <= cap_total
+    // Present if weekIndex(start) <= w < weekIndex(start) + WEEKS_DURATION
     for (const l of locCodes) {
-      for (const sISO of uniqueStartMondays) {
-        const cap = locByCode[l].capacity_total;
-        const c = `cap_start_${l}_${sISO}`;
-        ensureConstraint(c, { max: cap });
+      const capTotal = locByCode[l].capacity_total;
+      const capF = locByCode[l].cap_female_max;
+      const capM = locByCode[l].cap_male_max;
 
-        for (const e of EPs) {
-          const xName = `x|${e.ep_id}|${l}|${sISO}`;
-          if (model.variables[xName]) addCoef(xName, c, 1);
-        }
+      for (let w = 0; w < weeks.length; w++) {
+        const wISO = dateToISO(weeks[w]);
 
-        // gender caps if provided
-        const capF = locByCode[l].cap_female_max;
-        if (capF != null) {
-          const cF = `capF_start_${l}_${sISO}`;
-          ensureConstraint(cF, { max: capF });
-          for (const e of EPs) {
-            if (e.gender !== "F") continue;
-            const xName = `x|${e.ep_id}|${l}|${sISO}`;
-            if (model.variables[xName]) addCoef(xName, cF, 1);
-          }
-        }
+        // Sum of all x vars that imply presence in week w
+        const cCap = `cap_${l}_${wISO}`;
+        ensureConstraint(cCap, { max: capTotal });
 
-        const capM = locByCode[l].cap_male_max;
-        if (capM != null) {
-          const cM = `capM_start_${l}_${sISO}`;
-          ensureConstraint(cM, { max: capM });
-          for (const e of EPs) {
-            if (e.gender !== "M") continue;
-            const xName = `x|${e.ep_id}|${l}|${sISO}`;
-            if (model.variables[xName]) addCoef(xName, cM, 1);
+        const cCapF = (capF != null) ? `capF_${l}_${wISO}` : null;
+        const cCapM = (capM != null) ? `capM_${l}_${wISO}` : null;
+        if (cCapF) ensureConstraint(cCapF, { max: capF });
+        if (cCapM) ensureConstraint(cCapM, { max: capM });
+
+        // Never-alone: either 0 or >=2
+        // Introduce open var open|l|wISO
+        const openName = `open|${l}|${wISO}`;
+        makeBin(openName);
+
+        // H - 2*open >= 0   (min 0)
+        const cNAlo = `na_lo_${l}_${wISO}`;
+        ensureConstraint(cNAlo, { min: 0 });
+        addCoef(openName, cNAlo, -2);
+
+        // H - capTotal*open <= 0  (max 0)
+        const cNAhi = `na_hi_${l}_${wISO}`;
+        ensureConstraint(cNAhi, { max: 0 });
+        addCoef(openName, cNAhi, -capTotal);
+
+        // Add presence contributions
+        for (const xv of xVars) {
+          if (xv.l !== l) continue;
+
+          const sIdx = weekIndex.get(xv.sISO);
+          if (sIdx == null) continue;
+
+          const present = (sIdx <= w) && (w < sIdx + WEEKS_DURATION);
+          if (!present) continue;
+
+          addCoef(xv.varName, cCap, 1);
+          addCoef(xv.varName, cNAlo, 1);
+          addCoef(xv.varName, cNAhi, 1);
+
+          if (cCapF || cCapM) {
+            const ep = EPs.find(e => e.ep_id === xv.eid);
+            if (ep) {
+              if (cCapF && ep.gender === "F") addCoef(xv.varName, cCapF, 1);
+              if (cCapM && ep.gender === "M") addCoef(xv.varName, cCapM, 1);
+            }
           }
         }
       }
     }
 
     // Solve
-    setStatus("Solving MILP…", "");
+    setStatus("Solving MILP (can take a bit)…", "");
     const result = window.solver.Solve(model);
     if (!result.feasible) showError("No feasible solution found (given constraints).");
 
-    // Build assignments
+    // Build assignments output
     const assignments = [];
     for (const e of EPs) {
       let placed = null;
 
-      for (const l of locCodes) {
-        for (const s of (EP_allowed.get(e.ep_id) || [])) {
-          const sISO = dateToISO(s);
-          const xName = `x|${e.ep_id}|${l}|${sISO}`;
-          if ((result[xName] || 0) > 0.5) {
-            placed = { loc: l, startISO: sISO };
-            break;
-          }
+      for (const xv of xVars) {
+        if (xv.eid !== e.ep_id) continue;
+        if ((result[xv.varName] || 0) > 0.5) {
+          placed = { loc: xv.l, startISO: xv.sISO };
+          break;
         }
-        if (placed) break;
       }
 
       let endFridayISO = "";
       if (placed) {
         const startDate = new Date(placed.startISO);
-        // Friday of week N = start + (N-1) weeks + 4 days
         const endFriday = addDays(addWeeks(startDate, WEEKS_DURATION - 1), 4);
         endFridayISO = dateToISO(endFriday);
       }
@@ -445,10 +463,29 @@
         start_monday: placed ? placed.startISO : "",
         end_friday: placed ? endFridayISO : "",
         first_choice: normalizeCode(e.preferred_location_1),
+        preference_points: placed ? prefScore(e, placed.loc, PREF_POINTS) : 0
       });
     }
 
-    return assignments;
+    // Also export weekly load so you can sanity check fast
+    const weeklyLoad = [];
+    for (const l of locCodes) {
+      for (let w = 0; w < weeks.length; w++) {
+        const wISO = dateToISO(weeks[w]);
+        let head = 0;
+
+        for (const a of assignments) {
+          if (!a.location || a.location !== l) continue;
+          const sIdx = weekIndex.get(a.start_monday);
+          if (sIdx == null) continue;
+          if (sIdx <= w && w < sIdx + WEEKS_DURATION) head += 1;
+        }
+
+        if (head > 0) weeklyLoad.push({ loc_code: l, week_monday: wISO, headcount: head });
+      }
+    }
+
+    return { assignments, weeklyLoad };
   }
 
   // ---------------- Wire buttons ----------------
@@ -467,9 +504,11 @@
   btnRun.addEventListener("click", async () => {
     if (!epsData || !locData) showError("Please validate files first.");
 
-    const assignments = buildAndSolveModel();
+    const { assignments, weeklyLoad } = buildAndSolveModel();
     downloadCSV("assignment.csv", assignments);
-    setStatus("Done. assignment.csv downloaded.", "success");
+    downloadCSV("location_weekly_load.csv", weeklyLoad);
+
+    setStatus("Done. assignment.csv and location_weekly_load.csv downloaded.", "success");
   });
 
   // Initial sanity for solver load
@@ -482,5 +521,6 @@
     );
   }
 </script>
+
 </body>
 </html>
