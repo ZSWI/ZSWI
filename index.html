@@ -4,10 +4,7 @@
   <meta charset="utf-8" />
   <title>AIESEC Matching Tool</title>
 
-  <!-- CSV parser -->
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
-
-  <!-- Pure-JS MILP solver (no WASM, no Python) -->
   <script src="https://cdn.jsdelivr.net/npm/javascript-lp-solver@0.4.24/prod/solver.js"></script>
 
   <style>
@@ -45,6 +42,10 @@
     <input type="number" id="p2" value="120" step="1" /> /
     <input type="number" id="p3" value="20" step="1" /> /
     <input type="number" id="p4" value="0" step="1" />
+  </div>
+  <div class="row">
+    <label>Score weight (tie-breaker)</label>
+    <input type="number" id="scoreWeight" value="5" step="1" />
   </div>
 
   <div class="row">
@@ -94,6 +95,9 @@
   // ---------------- Normalizers ----------------
   function normalizeCode(s) {
     return (s || "").toLowerCase().trim().replaceAll(" ", "_");
+  }
+  function normalizeName(s) {
+    return (s || "").toLowerCase().trim().replace(/\s+/g, " ");
   }
   function isNoPreference(raw) {
     const p = normalizeCode(raw);
@@ -153,7 +157,7 @@
     return `${yyyy}-${mm}-${dd}`;
   }
   function nextMonday(d) {
-    // JS: Sunday=0 ... Saturday=6. We want Monday=1.
+    // JS: Sunday=0 ... Saturday=6. Monday=1.
     const day = d.getDay();
     const offset = (day === 1) ? 0 : ((8 - day) % 7);
     return addDays(d, offset);
@@ -168,7 +172,6 @@
     return out;
   }
   function lastStartMondayGivenLatestEnd(latestEnd, weeksDuration) {
-    // match your python: last Monday such that start + weeksDuration weeks <= latest_end
     const d = addWeeks(latestEnd, -weeksDuration);
     return nextMonday(d);
   }
@@ -177,7 +180,8 @@
   let epsData = null;
   let locData = null;
 
-  function runValidation() {
+  // ---------------- Validation + friend consistency ----------------
+  function runValidationAndFriendChecks() {
     const requiredEPCols = [
       "ep_id","full_name","gender","earliest_start_date","latest_end_date",
       "preferred_location_1","preferred_location_2","preferred_location_3","preferred_location_4",
@@ -195,14 +199,17 @@
       if (!locHeaders.includes(col)) showError(`Locations.csv missing column "${col}"`);
     });
 
+    // duplicates EP
     const epIds = epsData.map(r => (r.ep_id || "").trim());
     const dupEP = epIds.find((id, i) => id && epIds.indexOf(id) !== i);
     if (dupEP) showError(`Duplicate ep_id found: ${dupEP}`);
 
+    // duplicates locations
     const locCodes = locData.map(r => normalizeCode(r.loc_code));
     const dupLoc = locCodes.find((id, i) => id && locCodes.indexOf(id) !== i);
     if (dupLoc) showError(`Duplicate loc_code found: ${dupLoc}`);
 
+    // dates
     epsData.forEach((row, i) => {
       const start = parseDateFlexible(row.earliest_start_date);
       const end = parseDateFlexible(row.latest_end_date);
@@ -211,6 +218,7 @@
       if (start > end) showError(`Row ${i+2}: earliest_start_date after latest_end_date`);
     });
 
+    // preference existence
     const locSet = new Set(locCodes);
     epsData.forEach((row, i) => {
       for (let k=1;k<=4;k++) {
@@ -218,6 +226,33 @@
         if (isNoPreference(raw)) continue;
         const pref = normalizeCode(raw);
         if (!locSet.has(pref)) showError(`Row ${i+2}: preferred_location_${k} "${raw}" not in Locations.csv`);
+      }
+    });
+
+    // friend name checks (must be resolvable)
+    const nameToIds = new Map(); // normName -> [ep_id]
+    epsData.forEach(r => {
+      const nm = normalizeName(r.full_name);
+      const id = (r.ep_id || "").trim();
+      if (!nm || !id) return;
+      if (!nameToIds.has(nm)) nameToIds.set(nm, []);
+      nameToIds.get(nm).push(id);
+    });
+
+    epsData.forEach((row, i) => {
+      const wants = String(row.wants_pair || "").trim().toLowerCase() === "yes";
+      if (!wants) return;
+
+      const raw = String(row.pair_with_full_name || "").trim();
+      if (!raw) showError(`Row ${i+2}: wants_pair=yes but pair_with_full_name is empty`);
+
+      const friends = raw.split(",").map(s => normalizeName(s)).filter(Boolean);
+      if (friends.length === 0) showError(`Row ${i+2}: wants_pair=yes but no names found in pair_with_full_name`);
+
+      for (const fn of friends) {
+        const ids = nameToIds.get(fn) || [];
+        if (ids.length === 0) showError(`Row ${i+2}: friend "${fn}" not found in full_name list`);
+        if (ids.length > 1) showError(`Row ${i+2}: friend "${fn}" is ambiguous (multiple people share this name: ${ids.join(", ")})`);
       }
     });
 
@@ -240,12 +275,75 @@
     return 0;
   }
 
+  // ---------------- Friend groups (connected components) ----------------
+  function buildFriendGroups(EPs) {
+    // Map full_name -> ep_id (must be unique; we validated already)
+    const nameToId = new Map();
+    for (const e of EPs) nameToId.set(normalizeName(e.full_name), e.ep_id);
+
+    // Build undirected edges
+    const adj = new Map(); // ep_id -> Set(ep_id)
+    function addEdge(a, b) {
+      if (!adj.has(a)) adj.set(a, new Set());
+      if (!adj.has(b)) adj.set(b, new Set());
+      adj.get(a).add(b);
+      adj.get(b).add(a);
+    }
+
+    for (const e of EPs) {
+      if (!e.wants_pair) continue;
+
+      const friends = String(e.pair_with_full_name || "")
+        .split(",")
+        .map(s => normalizeName(s))
+        .filter(Boolean);
+
+      for (const fn of friends) {
+        const fid = nameToId.get(fn);
+        if (!fid) continue; // should not happen due to validation
+        if (fid === e.ep_id) continue;
+        addEdge(e.ep_id, fid);
+      }
+    }
+
+    // Connected components
+    const visited = new Set();
+    const groups = [];
+
+    for (const e of EPs) {
+      const start = e.ep_id;
+      if (visited.has(start)) continue;
+      if (!adj.has(start)) continue;
+
+      const stack = [start];
+      visited.add(start);
+      const comp = [];
+
+      while (stack.length) {
+        const u = stack.pop();
+        comp.push(u);
+        for (const v of adj.get(u)) {
+          if (!visited.has(v)) {
+            visited.add(v);
+            stack.push(v);
+          }
+        }
+      }
+
+      if (comp.length >= 2) groups.push(comp.sort());
+    }
+
+    return groups;
+  }
+
   // ---------------- Build and solve MILP ----------------
   function buildAndSolveModel() {
     if (!window.solver) showError("MILP solver library did not load (solver.js).");
 
     const WEEKS_DURATION = Number(document.getElementById("weeksDuration").value || 6);
     const PENALTY_UNASSIGNED = Number(document.getElementById("penaltyUnassigned").value || 5000);
+    const SCORE_WEIGHT = Number(document.getElementById("scoreWeight").value || 5);
+
     const PREF_POINTS = {
       1: Number(document.getElementById("p1").value || 1000),
       2: Number(document.getElementById("p2").value || 120),
@@ -259,7 +357,6 @@
       capacity_total: Number(r.capacity_total),
       cap_female_max: (r.cap_female_max === "" || r.cap_female_max == null) ? null : Number(r.cap_female_max),
       cap_male_max: (r.cap_male_max === "" || r.cap_male_max == null) ? null : Number(r.cap_male_max),
-      notes: r.notes || ""
     }));
     const locCodes = Locations.map(L => L.loc_code);
     const locByCode = Object.fromEntries(Locations.map(L => [L.loc_code, L]));
@@ -268,6 +365,7 @@
     const EPs = epsData.map(r => {
       const earliest = parseDateFlexible(r.earliest_start_date);
       const latest = parseDateFlexible(r.latest_end_date);
+      const score = isNaN(Number(String(r.score || "").replace(",", "."))) ? 0 : Number(String(r.score || "").replace(",", "."));
       return {
         ep_id: (r.ep_id || "").trim(),
         full_name: r.full_name || "",
@@ -276,7 +374,7 @@
         latest_end_date: latest,
         wants_pair: String(r.wants_pair || "").trim().toLowerCase() === "yes",
         pair_with_full_name: r.pair_with_full_name || "",
-        score: isNaN(Number(String(r.score || "").replace(",", "."))) ? 0 : Number(String(r.score || "").replace(",", ".")),
+        score: score,
         preferred_location_1: r.preferred_location_1 || "",
         preferred_location_2: r.preferred_location_2 || "",
         preferred_location_3: r.preferred_location_3 || "",
@@ -284,7 +382,7 @@
       };
     });
 
-    // Allowed Monday starts per EP (like python)
+    // Allowed Monday starts
     const EP_allowed = new Map(); // ep_id -> [Date Mondays]
     const allMondays = [];
     for (const e of EPs) {
@@ -296,14 +394,17 @@
     }
     if (allMondays.length === 0) showError("No feasible Monday starts found. Check date windows.");
 
-    // Global weeks grid (Mondays) like python
+    // Global weeks grid
     const minM = new Date(Math.min(...allMondays.map(d => d.getTime())));
     const maxAllowedStart = new Date(Math.max(...allMondays.map(d => d.getTime())));
     const maxM = addWeeks(maxAllowedStart, WEEKS_DURATION - 1);
-    const weeks = mondaysBetween(minM, maxM); // list of Mondays
+    const weeks = mondaysBetween(minM, maxM);
     const weekIndex = new Map(weeks.map((d, i) => [dateToISO(d), i]));
 
-    // Build model
+    // Build friend groups
+    const groups = buildFriendGroups(EPs);
+
+    // Model
     const model = {
       optimize: "obj",
       opType: "max",
@@ -330,9 +431,13 @@
       addCoef(varName, `bin_lo_${varName}`, 1);
       addCoef(varName, `bin_hi_${varName}`, 1);
     }
+    function fixToZero(varName) {
+      const c = `fix0_${varName}`;
+      ensureConstraint(c, { equal: 0 });
+      addCoef(varName, c, 1);
+    }
 
-    // Create x variables for all feasible (ep,loc,start)
-    // Also store for quick iteration
+    // Create x vars
     const xVars = []; // {eid, l, sISO, varName}
     for (const e of EPs) {
       const eid = e.ep_id;
@@ -343,18 +448,21 @@
           makeBin(varName);
           xVars.push({ eid, l, sISO, varName });
 
-          // preference points
+          // preferences
           const sc = prefScore(e, l, PREF_POINTS);
           if (sc) addObj(varName, sc);
 
-          // big bonus for first choice to mimic Stage-1 tie-break
+          // first-choice big bonus
           const first = normalizeCode(e.preferred_location_1);
           if (first && first === l) addObj(varName, 1000000);
+
+          // score tie-breaker (applies to any assignment)
+          addObj(varName, SCORE_WEIGHT * (e.score || 0));
         }
       }
     }
 
-    // Each EP exactly one outcome: sum_x + u == 1
+    // u vars + ep_one constraints
     for (const e of EPs) {
       const eid = e.ep_id;
       const c = `ep_one_${eid}`;
@@ -370,9 +478,7 @@
       }
     }
 
-    // Weekly occupancy constraints (the missing part!)
-    // For each location l and week w: headcount present that week <= cap_total
-    // Present if weekIndex(start) <= w < weekIndex(start) + WEEKS_DURATION
+    // Weekly occupancy + gender caps + never-alone
     for (const l of locCodes) {
       const capTotal = locByCode[l].capacity_total;
       const capF = locByCode[l].cap_female_max;
@@ -381,7 +487,6 @@
       for (let w = 0; w < weeks.length; w++) {
         const wISO = dateToISO(weeks[w]);
 
-        // Sum of all x vars that imply presence in week w
         const cCap = `cap_${l}_${wISO}`;
         ensureConstraint(cCap, { max: capTotal });
 
@@ -390,25 +495,20 @@
         if (cCapF) ensureConstraint(cCapF, { max: capF });
         if (cCapM) ensureConstraint(cCapM, { max: capM });
 
-        // Never-alone: either 0 or >=2
-        // Introduce open var open|l|wISO
+        // never-alone: either 0 or >=2
         const openName = `open|${l}|${wISO}`;
         makeBin(openName);
 
-        // H - 2*open >= 0   (min 0)
         const cNAlo = `na_lo_${l}_${wISO}`;
         ensureConstraint(cNAlo, { min: 0 });
         addCoef(openName, cNAlo, -2);
 
-        // H - capTotal*open <= 0  (max 0)
         const cNAhi = `na_hi_${l}_${wISO}`;
         ensureConstraint(cNAhi, { max: 0 });
         addCoef(openName, cNAhi, -capTotal);
 
-        // Add presence contributions
         for (const xv of xVars) {
           if (xv.l !== l) continue;
-
           const sIdx = weekIndex.get(xv.sISO);
           if (sIdx == null) continue;
 
@@ -430,16 +530,96 @@
       }
     }
 
+    // Friend groups: same (location,start) or all unassigned
+    // Implementation:
+    // - compute common starts = intersection of allowed starts
+    // - create y|group|l|s for each common start and location
+    // - tie each member: x[e,l,s] == y[group,l,s] for common starts
+    // - forbid non-common start vars for members (fix to 0)
+    // - enforce: sum_y + u_ref == 1
+    // - enforce: u_member == u_ref for all members
+    for (let gi = 0; gi < groups.length; gi++) {
+      const comp = groups[gi]; // array of ep_ids
+      const groupId = `g${gi}_${comp.join("_")}`;
+
+      // common starts (ISO strings)
+      let common = null;
+      for (const eid of comp) {
+        const arr = (EP_allowed.get(eid) || []).map(dateToISO);
+        const set = new Set(arr);
+        common = (common == null) ? set : new Set([...common].filter(x => set.has(x)));
+      }
+      const commonStarts = [...(common || new Set())].sort();
+
+      const ref = comp[0];
+      const uRef = `u|${ref}`;
+
+      // u equality across group
+      for (const eid of comp) {
+        const uE = `u|${eid}`;
+        const cEq = `u_eq_${groupId}_${eid}`;
+        ensureConstraint(cEq, { equal: 0 });
+        addCoef(uE, cEq, 1);
+        addCoef(uRef, cEq, -1);
+      }
+
+      if (commonStarts.length === 0) {
+        // no common start possible => force all x to 0 and keep u equal already
+        for (const xv of xVars) {
+          if (!comp.includes(xv.eid)) continue;
+          fixToZero(xv.varName);
+        }
+        continue;
+      }
+
+      // Forbid non-common starts for each member
+      for (const xv of xVars) {
+        if (!comp.includes(xv.eid)) continue;
+        if (!commonStarts.includes(xv.sISO)) fixToZero(xv.varName);
+      }
+
+      // Create group choice vars y[group,l,s]
+      const yVars = [];
+      for (const l of locCodes) {
+        for (const sISO of commonStarts) {
+          const yName = `y|${groupId}|${l}|${sISO}`;
+          makeBin(yName);
+          yVars.push(yName);
+
+          // Tie each member: x - y = 0 for (l,s)
+          for (const eid of comp) {
+            const xName = `x|${eid}|${l}|${sISO}`;
+            // only if x exists in model (it should, for common starts)
+            if (!model.variables[xName]) continue;
+            const cTie = `tie_${groupId}_${eid}_${l}_${sISO}`;
+            ensureConstraint(cTie, { equal: 0 });
+            addCoef(xName, cTie, 1);
+            addCoef(yName, cTie, -1);
+          }
+        }
+      }
+
+      // sum_y + u_ref == 1
+      const cChoose = `group_choose_${groupId}`;
+      ensureConstraint(cChoose, { equal: 1 });
+      addCoef(uRef, cChoose, 1);
+      for (const yName of yVars) addCoef(yName, cChoose, 1);
+
+      // (optional) limit sum_y <= 1 is implied by equality above, but safe:
+      const cAtMost = `group_atmost_${groupId}`;
+      ensureConstraint(cAtMost, { max: 1 });
+      for (const yName of yVars) addCoef(yName, cAtMost, 1);
+    }
+
     // Solve
     setStatus("Solving MILP (can take a bit)…", "");
     const result = window.solver.Solve(model);
     if (!result.feasible) showError("No feasible solution found (given constraints).");
 
-    // Build assignments output
+    // Build assignments
     const assignments = [];
     for (const e of EPs) {
       let placed = null;
-
       for (const xv of xVars) {
         if (xv.eid !== e.ep_id) continue;
         if ((result[xv.varName] || 0) > 0.5) {
@@ -459,15 +639,17 @@
         ep_id: e.ep_id,
         full_name: e.full_name,
         gender: e.gender,
+        score: e.score,
         location: placed ? placed.loc : "",
         start_monday: placed ? placed.startISO : "",
         end_friday: placed ? endFridayISO : "",
         first_choice: normalizeCode(e.preferred_location_1),
-        preference_points: placed ? prefScore(e, placed.loc, PREF_POINTS) : 0
+        preference_points: placed ? prefScore(e, placed.loc, PREF_POINTS) : 0,
+        grouped_with_friends: e.wants_pair ? "yes" : "no"
       });
     }
 
-    // Also export weekly load so you can sanity check fast
+    // Weekly load export
     const weeklyLoad = [];
     for (const l of locCodes) {
       for (let w = 0; w < weeks.length; w++) {
@@ -480,7 +662,6 @@
           if (sIdx == null) continue;
           if (sIdx <= w && w < sIdx + WEEKS_DURATION) head += 1;
         }
-
         if (head > 0) weeklyLoad.push({ loc_code: l, week_monday: wISO, headcount: head });
       }
     }
@@ -488,7 +669,7 @@
     return { assignments, weeklyLoad };
   }
 
-  // ---------------- Wire buttons ----------------
+  // ---------------- Buttons ----------------
   btnValidate.addEventListener("click", async () => {
     const epsFile = document.getElementById("epsFile").files[0];
     const locFile = document.getElementById("locFile").files[0];
@@ -498,7 +679,7 @@
     epsData = await parseCSV(epsFile);
     locData = await parseCSV(locFile);
 
-    runValidation();
+    runValidationAndFriendChecks();
   });
 
   btnRun.addEventListener("click", async () => {
@@ -511,7 +692,6 @@
     setStatus("Done. assignment.csv and location_weekly_load.csv downloaded.", "success");
   });
 
-  // Initial sanity for solver load
   if (!window.solver) {
     setStatus(
       "ERROR: MILP solver did not load.\n" +
@@ -521,6 +701,5 @@
     );
   }
 </script>
-
 </body>
 </html>
